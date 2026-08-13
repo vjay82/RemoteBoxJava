@@ -169,6 +169,11 @@ public final class RemoteBoxApplication extends JFrame {
             public void windowClosed(WindowEvent event) {
                 disconnect();
             }
+
+            @Override
+            public void windowGainedFocus(WindowEvent event) {
+                refreshAll();
+            }
         });
 
         setJMenuBar(createMenuBar());
