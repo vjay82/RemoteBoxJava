@@ -13,5 +13,5 @@ if errorlevel 1 (
 
 echo.
 echo Build completed successfully.
-echo JAR: "%CD%\target\remotebox-java-1.0.0.jar"
+echo JAR: "%CD%\target\remotebox-java-1.0.0-all.jar"
 exit /b 0

@@ -131,11 +131,7 @@ public final class RemoteBoxApplication extends JFrame {
         // The first run may probe WSL for a RemoteBox installation, so load before the UI starts.
         ApplicationSettings.shared();
         applyTaskbarIcon();
-        SwingUtilities.invokeLater(() -> {
-            installLookAndFeel();
-            RemoteBoxApplication app = new RemoteBoxApplication();
-            app.setVisible(true);
-        });
+        RemoteBox.showWindow(true);
     }
 
     /** macOS and most Linux desktops take the dock icon from the Taskbar API, not from the window. */
@@ -154,7 +150,8 @@ public final class RemoteBoxApplication extends JFrame {
 
     public RemoteBoxApplication() {
         super("RemoteBox");
-        setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        // Disposing instead of exiting keeps an embedding host application alive.
+        setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
         setIconImages(AppIcon.windowIcons());
         setMinimumSize(new Dimension(940, 630));
         setSize(1100, 740);
@@ -168,6 +165,7 @@ public final class RemoteBoxApplication extends JFrame {
             @Override
             public void windowClosed(WindowEvent event) {
                 disconnect();
+                RemoteBox.forget(RemoteBoxApplication.this);
             }
 
             @Override
@@ -4033,7 +4031,7 @@ public final class RemoteBoxApplication extends JFrame {
         }
     }
 
-    private static void installLookAndFeel() {
+    static void installLookAndFeel() {
         try (InputStream theme = RemoteBoxApplication.class.getResourceAsStream("/MiraDark.properties")) {
             if (theme == null) {
                 throw new IllegalStateException("MiraDark.properties is missing from the application resources.");

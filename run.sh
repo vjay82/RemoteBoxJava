@@ -5,7 +5,7 @@ set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$SCRIPT_DIR" || exit 1
 
-JAR="target/remotebox-java-1.0.0.jar"
+JAR="target/remotebox-java-1.0.0-all.jar"
 
 if [ ! -f "$JAR" ]; then
     echo "No built JAR was found. Building RemoteBox Java first..."

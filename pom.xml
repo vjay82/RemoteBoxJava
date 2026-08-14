@@ -58,7 +58,13 @@
                     </archive>
                 </configuration>
             </plugin>
-            <!-- Keep run.bat's `java -jar` launcher self-contained. -->
+            <!--
+                Keep run.bat's `java -jar` launcher self-contained. The shaded
+                jar is attached under the "all" classifier so the plain
+                remotebox-java-<version>.jar stays available for host
+                applications that embed RemoteBox as a library and already
+                provide FlatLaf and JNA themselves.
+            -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -71,6 +77,8 @@
                         </goals>
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>all</shadedClassifierName>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.remoteboxjava.RemoteBoxApplication</mainClass>

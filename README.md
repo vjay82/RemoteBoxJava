@@ -39,10 +39,11 @@ From this directory:
 mvn clean package
 ```
 
-The runnable JAR is created at:
+Two JARs are created:
 
 ```text
-target\remotebox-java-1.0.0.jar
+target\remotebox-java-1.0.0.jar        library JAR (classes only)
+target\remotebox-java-1.0.0-all.jar    runnable JAR (dependencies included)
 ```
 
 ## Run
@@ -56,8 +57,23 @@ mvn exec:java
 Using the built JAR:
 
 ```cmd
-java -jar target\remotebox-java-1.0.0.jar
+java -jar target\remotebox-java-1.0.0-all.jar
 ```
+
+## Use as a library
+
+The library JAR can be embedded into another Swing application. It needs
+FlatLaf and JNA Platform on the classpath (see the dependencies in `pom.xml`).
+
+```java
+com.remoteboxjava.RemoteBox.showWindow();
+```
+
+`RemoteBox.showWindow()` may be called from any thread, opens the window on
+the event dispatch thread and brings an already open window to the front. It
+does not install a look and feel, so the host application's theme is kept, and
+the application never calls `System.exit` — closing the window only disposes
+it.
 
 ## Connecting to VirtualBox
 

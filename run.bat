@@ -3,7 +3,7 @@ setlocal
 
 cd /d "%~dp0"
 
-set "JAR=target\remotebox-java-1.0.0.jar"
+set "JAR=target\remotebox-java-1.0.0-all.jar"
 
 if not exist "%JAR%" (
     echo No built JAR was found. Building RemoteBox Java first...

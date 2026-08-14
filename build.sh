@@ -14,4 +14,4 @@ fi
 
 echo
 echo "Build completed successfully."
-echo "JAR: $SCRIPT_DIR/target/remotebox-java-1.0.0.jar"
+echo "JAR: $SCRIPT_DIR/target/remotebox-java-1.0.0-all.jar"
