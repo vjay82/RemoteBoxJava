@@ -37,6 +37,13 @@ class RdpConnectionFileTest {
     }
 
     @Test
+    void leavesCredsspAtItsDefaultSoMstscStillNegotiates() {
+        String contents = RdpConnectionFile.contents("host", 3389, 1024, 768, 32, 0, true);
+        assertFalse(contents.contains("enablecredsspsupport"));
+        assertTrue(contents.contains("authentication level:i:0"));
+    }
+
+    @Test
     void writesTheScaleFactorOnlyWhenOneWasDetermined() {
         assertTrue(RdpConnectionFile.contents("host", 3389, 1024, 768, 32, 200, true)
                 .contains("desktopscalefactor:i:200"));

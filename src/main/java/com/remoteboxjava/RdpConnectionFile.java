@@ -56,8 +56,13 @@ final class RdpConnectionFile {
                 "drivestoredirect:s:",
                 "usbdevicestoredirect:s:",
                 "camerastoredirect:s:",
-                // VRDE offers neither NLA nor a verifiable certificate.
-                "enablecredsspsupport:i:0",
+                /*
+                 * VRDE has no verifiable certificate, so level 0 ("connect and don't warn")
+                 * suppresses the identity warning. CredSSP must stay at its default: turning
+                 * it off makes mstsc abort with "authentication is not enabled and the remote
+                 * computer requires that authentication be enabled" before it ever negotiates
+                 * with the VRDE server.
+                 */
                 "authentication level:i:0",
                 "prompt for credentials:i:0"));
         if (scalePercent > 0) {
