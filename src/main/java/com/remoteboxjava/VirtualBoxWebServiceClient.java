@@ -39,6 +39,8 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     private static final int GUEST_LOG_CHUNK_BYTES = 256 * 1024;
     private static final int MAX_GUEST_LOG_CHARACTERS = 8 * 1024 * 1024;
     private static final int SECURITY_PROMPT_TIMEOUT_SECONDS = 10;
+    /** The zoom entry only exists once mstsc has connected, which needs the guest to answer. */
+    private static final int ZOOM_TIMEOUT_SECONDS = 60;
 
     private final URI endpoint;
     private final HttpClient httpClient;
@@ -1804,9 +1806,13 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         RemoteBoxProfileReader.DisplaySettings settings = ApplicationSettings.shared().displaySettings();
         boolean vnc = extensionPack.toLowerCase(Locale.ROOT).contains("vnc");
         if (!vnc && settings.useMstsc()) {
-            String command = start(mstscCommand(machine.name(), host, port, settings));
+            String command = start(mstscProcess(machine.name(), host, port, settings));
             if (settings.shareClipboard()) {
                 MstscSecurityPrompt.confirmInBackground(host, SECURITY_PROMPT_TIMEOUT_SECONDS);
+            }
+            if (settings.autoScale()) {
+                MstscZoom.applyInBackground(host, RdpConnectionFile.primaryScreenScalePercent(),
+                        ZOOM_TIMEOUT_SECONDS);
             }
             return command;
         }
@@ -1837,12 +1843,13 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         if (command.isEmpty()) {
             throw new VBoxException("No RemoteBox display client is configured.");
         }
-        return start(command);
+        return start(new ProcessBuilder(command));
     }
 
-    private static String start(List<String> command) throws VBoxException {
+    private static String start(ProcessBuilder process) throws VBoxException {
+        List<String> command = process.command();
         try {
-            new ProcessBuilder(command).start();
+            process.start();
             return String.join(" ", command);
         } catch (IOException exception) {
             throw new VBoxException("Could not start the configured RemoteBox display client: "
@@ -1850,13 +1857,13 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         }
     }
 
-    private static List<String> mstscCommand(String machineName, String host, int port,
-                                             RemoteBoxProfileReader.DisplaySettings settings) throws VBoxException {
-        int scalePercent = settings.autoScale() ? RdpConnectionFile.primaryScreenScalePercent() : 0;
+    private static ProcessBuilder mstscProcess(String machineName, String host, int port,
+                                               RemoteBoxProfileReader.DisplaySettings settings)
+            throws VBoxException {
         try {
             Path connectionFile = RdpConnectionFile.write(machineName, host, port, settings.width(),
-                    settings.height(), settings.depth(), scalePercent, settings.shareClipboard());
-            return List.of("mstsc.exe", connectionFile.toString());
+                    settings.height(), settings.depth(), settings.shareClipboard());
+            return new ProcessBuilder("mstsc.exe", connectionFile.toString());
         } catch (IOException | IllegalArgumentException exception) {
             throw new VBoxException("Could not write the temporary RDP connection file: "
                     + exception.getMessage(), exception);

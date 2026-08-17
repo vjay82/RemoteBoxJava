@@ -180,6 +180,7 @@ public final class RemoteBoxApplication extends JFrame {
         add(createStatusBar(), BorderLayout.SOUTH);
         profiles.migrateSingleConnection();
         MstscSecurityPrompt.setLogger(message -> SwingUtilities.invokeLater(() -> appendLog(message)));
+        MstscZoom.setLogger(message -> SwingUtilities.invokeLater(() -> appendLog(message)));
 
         machineTree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION);
         machineTree.addTreeSelectionListener(event -> updateSelection());
@@ -1055,7 +1056,7 @@ public final class RemoteBoxApplication extends JFrame {
         rdpMode.add(useCommand);
 
         int screenScale = RdpConnectionFile.primaryScreenScalePercent();
-        JCheckBox autoScale = new JCheckBox("Match the scale factor to the primary screen"
+        JCheckBox autoScale = new JCheckBox("Zoom the session to the primary screen's scale"
                 + (screenScale > 0 ? " (currently " + screenScale + "%)" : ""), display.autoScale());
         JCheckBox shareClipboard = new JCheckBox("Share the clipboard with the guest — Windows then asks to "
                 + "confirm the connection", display.shareClipboard());

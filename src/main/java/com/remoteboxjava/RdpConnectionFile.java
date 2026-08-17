@@ -16,31 +16,30 @@ import java.util.List;
  */
 final class RdpConnectionFile {
 
-    /** The only values mstsc accepts for {@code desktopscalefactor}. */
-    private static final int[] SCALE_PERCENTAGES = {100, 125, 150, 175, 200, 250, 300, 400, 500};
-
     private RdpConnectionFile() {
     }
 
     /**
      * The width, height and depth are only the size the window opens with.
      * {@code dynamic resolution} needs the RDP 8.1 display-control channel, which
-     * VirtualBox's VRDE server does not implement, so {@code smart sizing} is what
-     * actually makes the window resizable: mstsc then scales the session to fit.
-     * {@code use multimon} defaults to 1 and would override the windowed mode.
+     * VirtualBox's VRDE server does not implement, so the session keeps that size and
+     * the window scrolls. {@code smart sizing} stays off: it stretches the session to
+     * the window, which blurs the guest as soon as the window is resized. There is no
+     * scaling setting either — {@code desktopscalefactor} is applied by the RDP server,
+     * and VRDE ignores it — so the zoom level comes from the compatibility layer mstsc
+     * is launched with. {@code use multimon} defaults to 1 and would override the
+     * windowed mode.
      *
-     * @param scalePercent {@code desktopscalefactor}, or 0 to let mstsc decide
      * @param shareClipboard requesting any local resource makes mstsc prompt for
      *                       confirmation, because the generated file is unsigned
      */
-    static String contents(String host, int port, int width, int height, int depth, int scalePercent,
-                           boolean shareClipboard) {
+    static String contents(String host, int port, int width, int height, int depth, boolean shareClipboard) {
         List<String> lines = new ArrayList<>(List.of(
                 "full address:s:" + address(host, port),
                 "screen mode id:i:1",
                 "use multimon:i:0",
                 "dynamic resolution:i:1",
-                "smart sizing:i:1",
+                "smart sizing:i:0",
                 "desktopwidth:i:" + width,
                 "desktopheight:i:" + height,
                 "session bpp:i:" + depth,
@@ -65,24 +64,21 @@ final class RdpConnectionFile {
                  */
                 "authentication level:i:0",
                 "prompt for credentials:i:0"));
-        if (scalePercent > 0) {
-            lines.add("desktopscalefactor:i:" + scalePercent);
-        }
         lines.add("");
         return String.join("\r\n", lines);
     }
 
-    static Path write(String machineName, String host, int port, int width, int height, int depth, int scalePercent,
+    static Path write(String machineName, String host, int port, int width, int height, int depth,
                       boolean shareClipboard) throws IOException {
         Path file = Files.createTempFile(prefix(machineName), ".rdp");
         file.toFile().deleteOnExit();
-        Files.writeString(file, contents(host, port, width, height, depth, scalePercent, shareClipboard),
+        Files.writeString(file, contents(host, port, width, height, depth, shareClipboard),
                 StandardCharsets.UTF_8);
         return file;
     }
 
     /**
-     * @return the scale matching the primary screen's DPI, or 0 when it cannot be
+     * @return the scale of the primary screen in percent, or 0 when it cannot be
      *         determined
      */
     static int primaryScreenScalePercent() {
@@ -95,24 +91,10 @@ final class RdpConnectionFile {
                     .getDefaultConfiguration()
                     .getDefaultTransform()
                     .getScaleX();
-            return nearestScalePercent(scale * 100);
+            return scale > 0 ? (int) Math.round(scale * 100) : 0;
         } catch (RuntimeException | Error ignored) {
             return 0;
         }
-    }
-
-    /** mstsc ignores a {@code desktopscalefactor} outside its fixed list. */
-    static int nearestScalePercent(double percent) {
-        if (percent <= 0) {
-            return 0;
-        }
-        int nearest = SCALE_PERCENTAGES[0];
-        for (int candidate : SCALE_PERCENTAGES) {
-            if (Math.abs(candidate - percent) < Math.abs(nearest - percent)) {
-                nearest = candidate;
-            }
-        }
-        return nearest;
     }
 
     /** Anything outside this set would let the value spill into another .rdp setting. */
