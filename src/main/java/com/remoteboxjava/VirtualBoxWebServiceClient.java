@@ -104,11 +104,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
                 .build();
         long started = System.nanoTime();
         try {
-            this.virtualBoxReference = callSingle(
-                    "IWebsessionManager_logon",
-                    element("username", this.username)
-                            + element("password", new String(this.password))
-            );
+            this.virtualBoxReference = logon();
             LOG.info("Signed in to {} in {} ms.", this.endpoint, (System.nanoTime() - started) / 1_000_000L);
             if (virtualBoxReference.isBlank()) {
                 throw new VBoxException("The VirtualBox web service did not return a session reference.");
@@ -119,9 +115,44 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         }
     }
 
+    private String logon() throws VBoxException {
+        return callSingle("IWebsessionManager_logon",
+                element("username", username) + element("password", new String(password)));
+    }
+
+    /**
+     * vboxwebsrv forgets every managed object when it restarts or when the session
+     * times out, and then rejects the session reference itself. Signing in again
+     * turns that into a hiccup instead of a client that keeps failing until the
+     * user reconnects by hand.
+     */
+    private <T> T withSessionRecovery(SoapTask<Void, T> call) throws VBoxException {
+        try {
+            return call.run(null);
+        } catch (VBoxException exception) {
+            if (!isExpiredSession(exception)) {
+                throw exception;
+            }
+            LOG.info("The VirtualBox web-service session expired; signing in again.");
+            machineReferences.clear();
+            machineDetails.clear();
+            virtualBoxReference = logon();
+            if (virtualBoxReference.isBlank()) {
+                throw new VBoxException("The VirtualBox web service did not return a session reference.");
+            }
+            return call.run(null);
+        }
+    }
+
+    private static boolean isExpiredSession(VBoxException exception) {
+        String message = exception.getMessage();
+        return message != null && message.contains("Invalid managed object reference");
+    }
+
     @Override
     public synchronized String version() throws VBoxException {
-        return callSingle("IVirtualBox_getVersion", element("_this", virtualBoxReference));
+        return withSessionRecovery(
+                ignored -> callSingle("IVirtualBox_getVersion", element("_this", virtualBoxReference)));
     }
 
     @Override
@@ -139,6 +170,10 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     @Override
     public synchronized List<VirtualMachine> listMachines(Consumer<List<VirtualMachine>> progress)
             throws VBoxException {
+        return withSessionRecovery(ignored -> loadMachines(progress));
+    }
+
+    private List<VirtualMachine> loadMachines(Consumer<List<VirtualMachine>> progress) throws VBoxException {
         List<String> references = callMany("IVirtualBox_getMachines", element("_this", virtualBoxReference));
         long listingStarted = System.nanoTime();
         List<VirtualMachine> summaries = summarize(references, progress);
@@ -1361,13 +1396,15 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
 
     @Override
     public synchronized HostMemory hostMemory() throws VBoxException {
-        String host = property(virtualBoxReference, "IVirtualBox_getHost");
-        try {
-            return new HostMemory(integerProperty(host, "IHost_getMemorySize", 0),
-                    integerProperty(host, "IHost_getMemoryAvailable", 0));
-        } finally {
-            release(host);
-        }
+        return withSessionRecovery(ignored -> {
+            String host = property(virtualBoxReference, "IVirtualBox_getHost");
+            try {
+                return new HostMemory(integerProperty(host, "IHost_getMemorySize", 0),
+                        integerProperty(host, "IHost_getMemoryAvailable", 0));
+            } finally {
+                release(host);
+            }
+        });
     }
 
     @Override
