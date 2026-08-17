@@ -69,7 +69,7 @@ public record ConnectionProfile(String name, String transport, String endpoint, 
     }
 
     public String transportLabel() {
-        return webService() ? "RemoteBox Web Service" : "Local / SSH VBoxManage";
+        return webService() ? "VirtualBox Web Service" : "VirtualBox VBoxManage (local or SSH)";
     }
 
     public String describe() {

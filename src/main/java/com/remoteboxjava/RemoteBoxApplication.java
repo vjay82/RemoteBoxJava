@@ -98,9 +98,10 @@ import org.apache.logging.log4j.Logger;
  */
 public final class RemoteBoxApplication extends JFrame {
     private static final Logger LOG = LogManager.getLogger(RemoteBoxApplication.class);
-    private static final String APP_NAME = "RemoteBox Java";
+    private static final String APP_NAME = "Virtual Machines";
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
-    private static final String[] TRANSPORT_LABELS = {"RemoteBox Web Service", "Local / SSH VBoxManage"};
+    private static final String[] TRANSPORT_LABELS = {
+            "VirtualBox Web Service", "VirtualBox VBoxManage (local or SSH)"};
     private static final int MAX_LOG_LINES = 2_000;
 
     private final ApplicationSettings preferences = ApplicationSettings.shared();
@@ -141,7 +142,7 @@ public final class RemoteBoxApplication extends JFrame {
         Thread.setDefaultUncaughtExceptionHandler((thread, failure) ->
                 LOG.error("Uncaught exception on thread {}.", thread.getName(), failure));
         long started = System.nanoTime();
-        LOG.info("RemoteBox starting (Java {} on {}).", System.getProperty("java.version"),
+        LOG.info("{} starting (Java {} on {}).", APP_NAME, System.getProperty("java.version"),
                 System.getProperty("os.name"));
         // The first run may probe WSL for a RemoteBox installation, so load before the UI starts.
         ApplicationSettings.shared();
@@ -166,7 +167,7 @@ public final class RemoteBoxApplication extends JFrame {
     }
 
     public RemoteBoxApplication() {
-        super("RemoteBox");
+        super(APP_NAME);
         long constructionStarted = System.nanoTime();
         // Disposing instead of exiting keeps an embedding host application alive.
         setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
@@ -218,7 +219,7 @@ public final class RemoteBoxApplication extends JFrame {
         logArea.setRows(6);
 
         refreshTimer = new Timer(preferences.getInt("refresh.seconds", 30) * 1_000, event -> refreshAll());
-        appendLog("Welcome to RemoteBox.");
+        appendLog("Welcome to " + APP_NAME + ".");
         appendLog("Settings: " + preferences.location());
         if (!preferences.importReport().summary().isBlank()) {
             appendLog(preferences.importReport().summary());
@@ -809,7 +810,7 @@ public final class RemoteBoxApplication extends JFrame {
         JLabel addressLabel = new JLabel();
         JTextField address = new JTextField(30);
         JTextField username = new JTextField(20);
-        JCheckBox autoConnect = new JCheckBox("Connect to this profile when RemoteBox starts");
+        JCheckBox autoConnect = new JCheckBox("Connect to this profile on start");
 
         ProfileListEditor editor = new ProfileListEditor(model, list, name, transport, addressLabel, address,
                 username, autoConnect, profiles.autoConnectName());
@@ -1065,8 +1066,8 @@ public final class RemoteBoxApplication extends JFrame {
 
     private void saveMessageLog() {
         JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Save RemoteBox Message Log");
-        chooser.setSelectedFile(new File("remotebox-message-log.txt"));
+        chooser.setDialogTitle("Save Message Log");
+        chooser.setSelectedFile(new File("virtual-machines-message-log.txt"));
         if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) {
             return;
         }
@@ -1142,7 +1143,7 @@ public final class RemoteBoxApplication extends JFrame {
         tabs.addTab("General", icon("rb_settings_16px.png", 16), general);
         tabs.addTab("Remote Display", icon("machine_16px.png", 16), remoteDisplay);
 
-        if (!showDialog("RemoteBox Preferences", tabs)) {
+        if (!showDialog("Preferences", tabs)) {
             return;
         }
         try {
@@ -1570,7 +1571,7 @@ public final class RemoteBoxApplication extends JFrame {
                 + "Size: " + appliance.length() + " bytes" + System.lineSeparator()
                 + "The configured VirtualBox transport will inspect and import this appliance. "
                 + "Per-machine import overrides require VirtualBox's appliance-specific API and are not "
-                + "available through the common RemoteBox SOAP contract.";
+                + "available through the common VirtualBox SOAP contract.";
         if (JOptionPane.showConfirmDialog(this, details, "Inspect Appliance Before Import",
                 JOptionPane.OK_CANCEL_OPTION, JOptionPane.INFORMATION_MESSAGE) != JOptionPane.OK_OPTION) {
             return;
@@ -3475,9 +3476,10 @@ public final class RemoteBoxApplication extends JFrame {
 
     private void showAbout() {
         JOptionPane.showMessageDialog(this,
-                "<html><b>RemoteBox Java</b><br>"
+                "<html><b>" + APP_NAME + "</b><br>"
                         + "A Maven/Java Swing VirtualBox client inspired by RemoteBox 3.7.<br><br>"
-                        + "Uses VBoxManage locally or through a configured remote command prefix.<br>"
+                        + "Connects through the VirtualBox web service, or runs VBoxManage locally or"
+                        + " through a configured remote command prefix.<br>"
                         + "Example remote command: <code>ssh user@server VBoxManage</code></html>",
                 "About " + APP_NAME, JOptionPane.INFORMATION_MESSAGE);
     }
