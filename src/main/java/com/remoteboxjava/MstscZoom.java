@@ -10,6 +10,9 @@ import com.sun.jna.platform.win32.WinUser.WNDENUMPROC;
 import com.sun.jna.win32.StdCallLibrary;
 import com.sun.jna.win32.W32APIOptions;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.util.Locale;
 import java.util.function.Consumer;
 
@@ -22,6 +25,7 @@ import java.util.function.Consumer;
  */
 final class MstscZoom {
 
+    private static final Logger LOG = LogManager.getLogger(MstscZoom.class);
     private static final String SESSION_CLASS = "TscShellContainerClass";
 
     private static final int WM_SYSCOMMAND = 0x0112;
@@ -73,6 +77,7 @@ final class MstscZoom {
                     logger.accept("Could not zoom the Remote Desktop session for " + host + ".");
                 }
             } catch (RuntimeException | UnsatisfiedLinkError | NoClassDefFoundError exception) {
+                LOG.warn("Could not zoom the Remote Desktop session for {}.", host, exception);
                 logger.accept("Could not zoom the Remote Desktop session: " + exception);
             }
         }, "mstsc-zoom");
@@ -96,6 +101,7 @@ final class MstscZoom {
                 Thread.sleep(POLL_INTERVAL_MILLIS);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
+                LOG.debug("Waiting for the Remote Desktop session window was interrupted.");
                 return 0;
             }
         }

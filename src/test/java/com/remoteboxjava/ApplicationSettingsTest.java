@@ -27,9 +27,10 @@ class ApplicationSettingsTest {
         assertTrue(Files.isRegularFile(file));
         String json = Files.readString(file, StandardCharsets.UTF_8);
         assertTrue(json.startsWith("{"));
-        assertTrue(json.contains("\"refresh.seconds\": 45"));
-        assertTrue(json.contains("\"confirm.actions\": false"));
-        assertTrue(json.contains("\"webservice.endpoint\": \"http://vbox.example.test:18083\""));
+        assertTrue(json.contains("\"refresh\": {"));
+        assertTrue(json.contains("\"seconds\": 45"));
+        assertTrue(json.contains("\"actions\": false"));
+        assertTrue(json.contains("\"endpoint\": \"http://vbox.example.test:18083\""));
 
         ApplicationSettings reloaded = new ApplicationSettings(directory, false);
         assertEquals("http://vbox.example.test:18083", reloaded.get("webservice.endpoint", ""));

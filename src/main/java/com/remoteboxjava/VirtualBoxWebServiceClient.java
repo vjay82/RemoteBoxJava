@@ -1,6 +1,8 @@
 package com.remoteboxjava;
 
 import com.remoteboxjava.VBoxManageClient.VBoxException;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -27,6 +29,14 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.function.Consumer;
 
 /**
  * Minimal client for the VirtualBox web service used by RemoteBox 3.7.
@@ -34,6 +44,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * local Windows VirtualBox registry.
  */
 public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
+    private static final Logger LOG = LogManager.getLogger(VirtualBoxWebServiceClient.class);
     private static final String VBOX_NAMESPACE = "http://www.virtualbox.org/";
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30);
     private static final int GUEST_LOG_CHUNK_BYTES = 256 * 1024;
@@ -41,11 +52,24 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     private static final int SECURITY_PROMPT_TIMEOUT_SECONDS = 10;
     /** The zoom entry only exists once mstsc has connected, which needs the guest to answer. */
     private static final int ZOOM_TIMEOUT_SECONDS = 60;
+    /**
+     * How many SOAP requests the guest-list load may have in flight. Each guest
+     * costs several round trips, so a serial load is dominated by network latency;
+     * vboxwebsrv serves requests from a thread pool and handles this comfortably.
+     */
+    private static final int LIST_PARALLELISM = 8;
+    /** How often the still incomplete guest list is handed to the UI. */
+    private static final long PARTIAL_PUBLISH_NANOS = Duration.ofMillis(250).toNanos();
 
     private final URI endpoint;
     private final HttpClient httpClient;
     private final String username;
     private final char[] password;
+    private final ExecutorService listExecutor = Executors.newFixedThreadPool(LIST_PARALLELISM, runnable -> {
+        Thread worker = new Thread(runnable, "RemoteBox-soap");
+        worker.setDaemon(true);
+        return worker;
+    });
     /**
      * SOAP object references returned by IVirtualBox_getMachines. These values
      * are opaque, session-scoped managed-object references and must be retained
@@ -55,6 +79,12 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
      * this map is shared between threads.
      */
     private final Map<String, String> machineReferences = new ConcurrentHashMap<>();
+    /**
+     * Guest fields that only change when the machine is reconfigured, keyed by VM
+     * UUID. Caching them keeps the periodic refresh down to four round trips per
+     * guest instead of eleven.
+     */
+    private final Map<String, MachineDetails> machineDetails = new ConcurrentHashMap<>();
     /**
      * Older VirtualBox web-service versions predate IMachine drag-and-drop
      * operations. A null value means not yet detected.
@@ -67,14 +97,19 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         this.username = username == null ? "" : username;
         this.password = password == null ? new char[0] : password.clone();
         this.httpClient = HttpClient.newBuilder()
+                // vboxwebsrv speaks HTTP/1.1 only; asking for HTTP/2 just adds an
+                // ALPN negotiation to every new TLS connection.
+                .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(REQUEST_TIMEOUT)
                 .build();
+        long started = System.nanoTime();
         try {
             this.virtualBoxReference = callSingle(
                     "IWebsessionManager_logon",
                     element("username", this.username)
                             + element("password", new String(this.password))
             );
+            LOG.info("Signed in to {} in {} ms.", this.endpoint, (System.nanoTime() - started) / 1_000_000L);
             if (virtualBoxReference.isBlank()) {
                 throw new VBoxException("The VirtualBox web service did not return a session reference.");
             }
@@ -91,24 +126,28 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
 
     @Override
     public synchronized List<VirtualMachine> listMachines() throws VBoxException {
-        List<String> references = callMany("IVirtualBox_getMachines", element("_this", virtualBoxReference));
-        List<VirtualMachine> machines = new ArrayList<>();
-        Map<String, String> refreshed = new HashMap<>();
+        return listMachines(machines -> {
+        });
+    }
 
-        for (String reference : references) {
-            VirtualMachine machine = new VirtualMachine(
-                    property(reference, "IMachine_getName"),
-                    property(reference, "IMachine_getId"),
-                    property(reference, "IMachine_getState"),
-                    property(reference, "IMachine_getOSTypeId"),
-                    integerProperty(reference, "IMachine_getMemorySize", 0),
-                    integerProperty(reference, "IMachine_getCPUCount", 1),
-                    groupProperty(reference),
-                    property(reference, "IMachine_getDescription"),
-                    vrdePort(reference)
-            );
-            refreshed.put(machine.id(), reference);
-            machines.add(machine);
+    /**
+     * Loads the guest list in two passes. The first pass reads only what the guest
+     * tree needs and hands it to {@code progress}; the second fills in the
+     * configuration fields that are not yet cached. Both passes run their per-guest
+     * round trips concurrently.
+     */
+    @Override
+    public synchronized List<VirtualMachine> listMachines(Consumer<List<VirtualMachine>> progress)
+            throws VBoxException {
+        List<String> references = callMany("IVirtualBox_getMachines", element("_this", virtualBoxReference));
+        long listingStarted = System.nanoTime();
+        List<VirtualMachine> summaries = summarize(references, progress);
+        LOG.info("Read the summary of {} guests in {} ms ({} round trips, {} in flight).", references.size(),
+                (System.nanoTime() - listingStarted) / 1_000_000L, references.size() * 4, LIST_PARALLELISM);
+
+        Map<String, String> refreshed = new HashMap<>();
+        for (int index = 0; index < summaries.size(); index++) {
+            refreshed.put(summaries.get(index).id(), references.get(index));
         }
 
         /*
@@ -119,12 +158,183 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         List<String> stale = new ArrayList<>(machineReferences.values());
         machineReferences.clear();
         machineReferences.putAll(refreshed);
+        machineDetails.keySet().retainAll(refreshed.keySet());
         for (String reference : stale) {
             if (!refreshed.containsValue(reference)) {
-                release(reference);
+                releaseLater(reference);
             }
         }
-        return machines;
+
+        progress.accept(summaries);
+
+        List<VirtualMachine> pending = summaries.stream().filter(machine -> !machine.hasDetails()).toList();
+        if (pending.isEmpty()) {
+            LOG.debug("All {} guests served their configuration from the cache.", summaries.size());
+            return summaries;
+        }
+
+        long detailsStarted = System.nanoTime();
+        List<MachineDetails> loaded = inParallel(pending, machine -> loadDetails(refreshed.get(machine.id())));
+        LOG.info("Read the configuration of {} guests in {} ms.", pending.size(),
+                (System.nanoTime() - detailsStarted) / 1_000_000L);
+        for (int index = 0; index < pending.size(); index++) {
+            machineDetails.put(pending.get(index).id(), loaded.get(index));
+        }
+
+        List<VirtualMachine> complete = new ArrayList<>(summaries.size());
+        for (VirtualMachine machine : summaries) {
+            complete.add(machine.hasDetails() ? machine : withDetails(machine, machineDetails.get(machine.id())));
+        }
+        return complete;
+    }
+
+    /**
+     * Reads the guest summaries concurrently and publishes the guests already
+     * known while the rest are still loading. VirtualBox can take seconds for the
+     * first access to a guest whose configuration it still has to read from disk,
+     * and that must not hold back the whole list.
+     */
+    private List<VirtualMachine> summarize(List<String> references, Consumer<List<VirtualMachine>> progress)
+            throws VBoxException {
+        if (references.size() < 2) {
+            List<VirtualMachine> summaries = new ArrayList<>(references.size());
+            for (String reference : references) {
+                summaries.add(machineSummary(reference));
+            }
+            return summaries;
+        }
+
+        CompletionService<IndexedSummary> completion = new ExecutorCompletionService<>(listExecutor);
+        for (int index = 0; index < references.size(); index++) {
+            int position = index;
+            String reference = references.get(index);
+            completion.submit(() -> new IndexedSummary(position, machineSummary(reference)));
+        }
+
+        VirtualMachine[] summaries = new VirtualMachine[references.size()];
+        VBoxException failure = null;
+        long published = System.nanoTime();
+        for (int completed = 0; completed < references.size(); completed++) {
+            try {
+                IndexedSummary summary = completion.take().get();
+                summaries[summary.index()] = summary.machine();
+            } catch (ExecutionException exception) {
+                if (failure == null) {
+                    failure = exception.getCause() instanceof VBoxException cause
+                            ? cause
+                            : new VBoxException("The VirtualBox web service request failed.", exception.getCause());
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new VBoxException("VirtualBox web-service request was interrupted.", exception);
+            }
+            if (completed < references.size() - 1 && System.nanoTime() - published >= PARTIAL_PUBLISH_NANOS) {
+                published = System.nanoTime();
+                progress.accept(resolved(summaries));
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+        return Arrays.asList(summaries);
+    }
+
+    private static List<VirtualMachine> resolved(VirtualMachine[] summaries) {
+        List<VirtualMachine> known = new ArrayList<>(summaries.length);
+        for (VirtualMachine machine : summaries) {
+            if (machine != null) {
+                known.add(machine);
+            }
+        }
+        return known;
+    }
+
+    private record IndexedSummary(int index, VirtualMachine machine) {
+    }
+
+    /** Reads the fields the guest tree renders, reusing cached configuration data. */
+    private VirtualMachine machineSummary(String reference) throws VBoxException {        String id = property(reference, "IMachine_getId");
+        return withDetails(new VirtualMachine(
+                property(reference, "IMachine_getName"),
+                id,
+                property(reference, "IMachine_getState"),
+                "", 0, 0,
+                groupProperty(reference),
+                "", ""
+        ), machineDetails.get(id));
+    }
+
+    private MachineDetails loadDetails(String machineReference) throws VBoxException {
+        String vrdeServer = property(machineReference, "IMachine_getVRDEServer");
+        try {
+            return new MachineDetails(
+                    property(machineReference, "IMachine_getOSTypeId"),
+                    integerProperty(machineReference, "IMachine_getMemorySize", 0),
+                    integerProperty(machineReference, "IMachine_getCPUCount", 1),
+                    property(machineReference, "IMachine_getDescription"),
+                    callSingle("IVRDEServer_getVRDEProperty",
+                            element("_this", vrdeServer) + element("key", "TCP/Ports"))
+            );
+        } finally {
+            releaseLater(vrdeServer);
+        }
+    }
+
+    private static VirtualMachine withDetails(VirtualMachine machine, MachineDetails details) {
+        if (details == null) {
+            return machine;
+        }
+        return new VirtualMachine(machine.name(), machine.id(), machine.state(), details.osType(),
+                details.memoryMb(), details.cpuCount(), machine.groups(), details.description(), details.vrdePort());
+    }
+
+    /**
+     * Runs one SOAP conversation per input concurrently and returns the results in
+     * input order. Every task is awaited even after a failure so no managed object
+     * reference is orphaned on the server.
+     */
+    private <S, T> List<T> inParallel(List<S> inputs, SoapTask<S, T> task) throws VBoxException {
+        List<T> results = new ArrayList<>(inputs.size());
+        if (inputs.size() < 2) {
+            for (S input : inputs) {
+                results.add(task.run(input));
+            }
+            return results;
+        }
+
+        List<Future<T>> futures = new ArrayList<>(inputs.size());
+        for (S input : inputs) {
+            futures.add(listExecutor.submit(() -> task.run(input)));
+        }
+
+        VBoxException failure = null;
+        for (Future<T> future : futures) {
+            try {
+                results.add(future.get());
+            } catch (ExecutionException exception) {
+                if (failure == null) {
+                    failure = exception.getCause() instanceof VBoxException cause
+                            ? cause
+                            : new VBoxException("The VirtualBox web service request failed.", exception.getCause());
+                }
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new VBoxException("VirtualBox web-service request was interrupted.", exception);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+        return results;
+    }
+
+    @FunctionalInterface
+    private interface SoapTask<S, T> {
+        T run(S input) throws VBoxException;
+    }
+
+    /** Configuration fields that survive a guest-list refresh unchanged. */
+    private record MachineDetails(String osType, int memoryMb, int cpuCount, String description, String vrdePort) {
     }
 
     @Override
@@ -133,6 +343,8 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             String session = virtualBoxReference;
             virtualBoxReference = null;
             machineReferences.clear();
+            machineDetails.clear();
+            listExecutor.shutdownNow();
             if (session != null && !session.isBlank()) {
                 // Logging off releases every managed object of this session server-side,
                 // so no per-object release round trips are needed here.
@@ -153,8 +365,23 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         }
         try {
             callMany("IManagedObjectRef_release", element("_this", reference));
-        } catch (VBoxException ignored) {
-            // The server drops the reference at logoff at the latest.
+        } catch (VBoxException exception) {
+            LOG.debug("Releasing a managed object reference failed; logoff drops it anyway.", exception);
+        }
+    }
+
+    /**
+     * Releases a reference off the calling thread. Cleanup round trips must not
+     * lengthen a guest-list refresh the user is waiting for.
+     */
+    private void releaseLater(String reference) {
+        if (reference == null || reference.isBlank()) {
+            return;
+        }
+        try {
+            listExecutor.execute(() -> release(reference));
+        } catch (RejectedExecutionException exception) {
+            LOG.debug("The session is closing, so logoff releases the reference instead.", exception);
         }
     }
 
@@ -433,6 +660,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             callMany("IMachine_unregister",
                     element("_this", machineReference) + element("cleanupMode", "DetachAllReturnNone"));
             machineReferences.remove(machine.id());
+            machineDetails.remove(machine.id());
             return;
         }
 
@@ -448,6 +676,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
                 element("_this", machineReference) + media);
         waitForProgress(progress, "delete the guest files");
         machineReferences.remove(machine.id());
+        machineDetails.remove(machine.id());
     }
 
     @Override
@@ -1032,6 +1261,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
                         if (!isUnsupportedDragAndDropOperation(legacyFailure)) {
                             throw legacyFailure;
                         }
+                        LOG.info("This VirtualBox server has no drag-and-drop API; the setting is ignored.");
                         dragAndDropSupported = false;
                     }
                 }
@@ -1063,6 +1293,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             if (!isUnsupportedDragAndDropOperation(exception)) {
                 throw exception;
             }
+            LOG.info("This VirtualBox server has no drag-and-drop API; reporting it as disabled.");
             dragAndDropSupported = false;
             return "disabled";
         }
@@ -1198,8 +1429,8 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             if (locked) {
                 try {
                     unlock(session);
-                } catch (VBoxException ignored) {
-                    // The display client was already launched; preserve its outcome.
+                } catch (VBoxException exception) {
+                    LOG.debug("Unlocking after launching the display client failed.", exception);
                 }
             }
             release(session);
@@ -1215,6 +1446,9 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         String session = newSession();
         boolean locked = false;
         VBoxException failure = null;
+        // A write lock exists to change the configuration, so the cached fields are
+        // no longer trustworthy regardless of the outcome.
+        machineDetails.remove(machine.id());
         try {
             callMany("IMachine_lockMachine",
                     element("_this", findMachine(machine))
@@ -1227,16 +1461,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             throw exception;
         } finally {
             if (locked) {
-                try {
-                    unlock(session);
-                } catch (VBoxException unlockFailure) {
-                    if (failure != null) {
-                        failure.addSuppressed(unlockFailure);
-                    } else {
-                        release(session);
-                        throw unlockFailure;
-                    }
-                }
+                unlockAfter(session, failure);
             }
             release(session);
         }
@@ -1269,16 +1494,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             throw exception;
         } finally {
             if (locked) {
-                try {
-                    unlock(session);
-                } catch (VBoxException unlockFailure) {
-                    if (failure != null) {
-                        failure.addSuppressed(unlockFailure);
-                    } else {
-                        release(session);
-                        throw unlockFailure;
-                    }
-                }
+                unlockAfter(session, failure);
             }
             release(session);
         }
@@ -1286,6 +1502,21 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
 
     private void unlock(String session) throws VBoxException {
         callMany("ISession_unlockMachine", element("_this", session));
+    }
+
+    /** Keeps the failure that closed the session while still reporting the failed unlock. */
+    private void unlockAfter(String session, VBoxException failure) throws VBoxException {
+        try {
+            unlock(session);
+        } catch (VBoxException unlockFailure) {
+            LOG.warn("Unlocking the guest session failed.", unlockFailure);
+            if (failure != null) {
+                failure.addSuppressed(unlockFailure);
+            } else {
+                release(session);
+                throw unlockFailure;
+            }
+        }
     }
 
     private void waitForProgress(String progress, String action) throws VBoxException {
@@ -1379,16 +1610,6 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     private String groupProperty(String machineReference) throws VBoxException {
         List<String> groups = callMany("IMachine_getGroups", element("_this", machineReference));
         return groups.isEmpty() ? "/" : groups.get(0);
-    }
-
-    private String vrdePort(String machineReference) throws VBoxException {
-        String vrdeReference = property(machineReference, "IMachine_getVRDEServer");
-        try {
-            return callSingle("IVRDEServer_getVRDEProperty",
-                    element("_this", vrdeReference) + element("key", "TCP/Ports"));
-        } finally {
-            release(vrdeReference);
-        }
     }
 
     private String networkAdapter(String machineReference, int adapterIndex) throws VBoxException {
@@ -1659,9 +1880,15 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
 
+        long started = System.nanoTime();
         try {
             HttpResponse<String> response = httpClient.send(request,
                     HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("{} took {} ms ({} bytes, HTTP {}).", operation,
+                        (System.nanoTime() - started) / 1_000_000L,
+                        response.body() == null ? 0 : response.body().length(), response.statusCode());
+            }
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
                 /*
                  * VirtualBox reports API errors as SOAP 1.1 faults, which arrive with
@@ -1674,9 +1901,12 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             }
             return response.body();
         } catch (IOException exception) {
+            LOG.warn("{} could not reach {} after {} ms.", operation, endpoint,
+                    (System.nanoTime() - started) / 1_000_000L, exception);
             throw new VBoxException("Could not reach the VirtualBox web service at " + endpoint + ".", exception);
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
+            LOG.warn("{} was interrupted.", operation);
             throw new VBoxException("VirtualBox web-service request was interrupted.", exception);
         }
     }
@@ -1765,7 +1995,8 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             Document document = parseDocument(body);
             NodeList faults = document.getElementsByTagNameNS("*", "Fault");
             return faults.getLength() == 0 ? Optional.empty() : Optional.of(describeFault(faults.item(0)));
-        } catch (Exception ignored) {
+        } catch (Exception exception) {
+            LOG.debug("A response mentioning a fault could not be parsed.", exception);
             return Optional.empty();
         }
     }

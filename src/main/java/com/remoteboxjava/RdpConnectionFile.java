@@ -1,5 +1,8 @@
 package com.remoteboxjava;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.awt.GraphicsEnvironment;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -15,6 +18,7 @@ import java.util.List;
  * scaling or clipboard redirection. Those exist only as connection-file settings.
  */
 final class RdpConnectionFile {
+    private static final Logger LOG = LogManager.getLogger(RdpConnectionFile.class);
 
     private RdpConnectionFile() {
     }
@@ -92,7 +96,8 @@ final class RdpConnectionFile {
                     .getDefaultTransform()
                     .getScaleX();
             return scale > 0 ? (int) Math.round(scale * 100) : 0;
-        } catch (RuntimeException | Error ignored) {
+        } catch (RuntimeException | Error exception) {
+            LOG.debug("Could not determine the primary screen scale.", exception);
             return 0;
         }
     }

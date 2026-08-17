@@ -1,5 +1,8 @@
 package com.remoteboxjava;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -23,6 +26,7 @@ import java.util.regex.Pattern;
  * Examples: {@code VBoxManage}, {@code ssh user@host VBoxManage}.
  */
 public final class VBoxManageClient implements VirtualBoxClient {
+    private static final Logger LOG = LogManager.getLogger(VBoxManageClient.class);
     private static final Duration COMMAND_TIMEOUT = Duration.ofSeconds(45);
     private static final Duration LONG_OPERATION_TIMEOUT = Duration.ofMinutes(15);
     private static final Pattern MACHINE_PATTERN = Pattern.compile("^\"(.*)\"\\s+\\{([\\w-]+)}$");
@@ -187,6 +191,7 @@ public final class VBoxManageClient implements VirtualBoxClient {
                 try {
                     execute("unregistervm", specification.name(), "--delete");
                 } catch (VBoxException cleanupFailure) {
+                    LOG.warn("Could not remove the half-created guest '{}'.", specification.name(), cleanupFailure);
                     exception.addSuppressed(cleanupFailure);
                 }
             }
@@ -534,7 +539,8 @@ public final class VBoxManageClient implements VirtualBoxClient {
         String driver = info.getOrDefault("audio-driver", "default");
         try {
             return new AudioSettings(enabled, controller, driver);
-        } catch (IllegalArgumentException ignored) {
+        } catch (IllegalArgumentException exception) {
+            LOG.debug("VirtualBox reported an unknown audio configuration; falling back to AC97.", exception);
             return new AudioSettings(enabled, "ac97", "default");
         }
     }
@@ -623,8 +629,8 @@ public final class VBoxManageClient implements VirtualBoxClient {
             try {
                 rules.add(new NatPortForwardRule(values[0], values[1], values[2],
                         Integer.parseInt(values[3]), values[4], Integer.parseInt(values[5])));
-            } catch (IllegalArgumentException ignored) {
-                // Ignore malformed legacy rules but keep valid rules editable.
+            } catch (IllegalArgumentException exception) {
+                LOG.warn("Skipping a malformed NAT port-forwarding rule.", exception);
             }
         }
         return rules;
@@ -877,6 +883,7 @@ public final class VBoxManageClient implements VirtualBoxClient {
             try {
                 execute("closemedium", "disk", path, "--delete");
             } catch (VBoxException cleanupFailure) {
+                LOG.warn("Could not delete the orphaned disk {}.", path, cleanupFailure);
                 exception.addSuppressed(cleanupFailure);
             }
             throw exception;
@@ -1026,8 +1033,8 @@ public final class VBoxManageClient implements VirtualBoxClient {
                         "on".equalsIgnoreCase(info.getOrDefault("USBFilterActive" + suffix, "on")),
                         info.getOrDefault("USBFilterVendorId" + suffix, ""),
                         info.getOrDefault("USBFilterProductId" + suffix, "")));
-            } catch (IllegalArgumentException ignored) {
-                // Ignore a malformed legacy filter while preserving the editable filters.
+            } catch (IllegalArgumentException exception) {
+                LOG.warn("Skipping a malformed USB device filter.", exception);
             }
         }
         return filters;
@@ -1106,8 +1113,8 @@ public final class VBoxManageClient implements VirtualBoxClient {
             if (screenshot != null) {
                 try {
                     Files.deleteIfExists(screenshot);
-                } catch (IOException ignored) {
-                    // The system temporary-file cleanup will handle any locked file.
+                } catch (IOException exception) {
+                    LOG.debug("Could not delete the temporary screenshot file.", exception);
                 }
             }
         }
@@ -1249,6 +1256,7 @@ public final class VBoxManageClient implements VirtualBoxClient {
         List<String> command = new ArrayList<>(commandPrefix);
         command.addAll(arguments);
 
+        long started = System.nanoTime();
         Path outputFile = null;
         try {
             outputFile = Files.createTempFile("remotebox-vboxmanage-", ".log");
@@ -1261,28 +1269,34 @@ public final class VBoxManageClient implements VirtualBoxClient {
             if (!process.waitFor(timeout.toMillis(), TimeUnit.MILLISECONDS)) {
                 process.destroyForcibly();
                 process.waitFor();
+                LOG.warn("{} timed out after {} seconds.", String.join(" ", command), timeout.toSeconds());
                 throw new VBoxException("VirtualBox command timed out after " + timeout.toSeconds() + " seconds.");
             }
 
             String output = Files.readString(outputFile, StandardCharsets.UTF_8);
+            LOG.debug("{} exited with {} after {} ms.", String.join(" ", command), process.exitValue(),
+                    (System.nanoTime() - started) / 1_000_000L);
             if (process.exitValue() != 0) {
                 String message = output.isBlank()
                         ? "VirtualBox returned exit code " + process.exitValue() + "."
                         : output.trim();
+                LOG.warn("{} failed: {}", String.join(" ", command), message);
                 throw new VBoxException(message);
             }
             return output;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
+            LOG.warn("{} was interrupted.", String.join(" ", command));
             throw new VBoxException("VirtualBox command was interrupted.", exception);
         } catch (IOException exception) {
+            LOG.warn("Could not run {}.", String.join(" ", command), exception);
             throw new VBoxException("Could not run VirtualBox command: " + String.join(" ", command), exception);
         } finally {
             if (outputFile != null) {
                 try {
                     Files.deleteIfExists(outputFile);
-                } catch (IOException ignored) {
-                    // The system temporary-file cleanup will handle a temporarily locked file.
+                } catch (IOException exception) {
+                    LOG.debug("Could not delete the temporary output file {}.", outputFile, exception);
                 }
             }
         }

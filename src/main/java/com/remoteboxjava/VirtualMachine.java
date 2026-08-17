@@ -32,6 +32,14 @@ public record VirtualMachine(
         );
     }
 
+    /**
+     * Whether the configuration fields have been read yet. The web-service client
+     * publishes the guest list before them so the tree can render immediately.
+     */
+    public boolean hasDetails() {
+        return cpuCount > 0;
+    }
+
     public boolean isRunning() {
         return "running".equals(normalizedState());
     }

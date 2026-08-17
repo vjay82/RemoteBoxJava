@@ -14,7 +14,8 @@ import java.util.Set;
  */
 public final class ConnectionProfiles {
     static final String PREFIX = "profiles.";
-    private static final String COUNT_KEY = PREFIX + "count";
+    /** Serialised as a JSON array, so every entry key below it is an index. */
+    private static final String LIST_PREFIX = PREFIX + "list.";
     private static final String AUTO_CONNECT_KEY = PREFIX + "autoConnect";
 
     private final ApplicationSettings settings;
@@ -24,13 +25,12 @@ public final class ConnectionProfiles {
     }
 
     public List<ConnectionProfile> all() {
-        int count = settings.getInt(COUNT_KEY, 0);
-        List<ConnectionProfile> profiles = new ArrayList<>(count);
-        for (int index = 0; index < count; index++) {
-            String key = PREFIX + index + ".";
+        List<ConnectionProfile> profiles = new ArrayList<>();
+        for (int index = 0; ; index++) {
+            String key = LIST_PREFIX + index + ".";
             String name = settings.get(key + "name", "");
             if (name.isBlank()) {
-                continue;
+                return profiles;
             }
             profiles.add(new ConnectionProfile(name,
                     settings.get(key + "transport", ConnectionProfile.WEB_SERVICE),
@@ -38,7 +38,27 @@ public final class ConnectionProfiles {
                     settings.get(key + "username", ""),
                     settings.get(key + "command", ConnectionProfile.defaultCommand())));
         }
-        return profiles;
+    }
+
+    /** @return the stored password of the profile, encrypted, or an empty string */
+    public String password(String profileName) {
+        List<ConnectionProfile> profiles = all();
+        for (int index = 0; index < profiles.size(); index++) {
+            if (profiles.get(index).name().equals(profileName)) {
+                return settings.get(LIST_PREFIX + index + ".password", "");
+            }
+        }
+        return "";
+    }
+
+    public void storePassword(String profileName, String protectedPassword) {
+        List<ConnectionProfile> profiles = all();
+        for (int index = 0; index < profiles.size(); index++) {
+            if (profiles.get(index).name().equals(profileName)) {
+                settings.put(LIST_PREFIX + index + ".password", protectedPassword);
+                return;
+            }
+        }
     }
 
     public Optional<ConnectionProfile> byName(String name) {
@@ -63,19 +83,31 @@ public final class ConnectionProfiles {
                 throw new IllegalArgumentException("Profile names must be unique: " + profile.name());
             }
         }
+        // Rewriting the list must not silently drop the passwords it does not carry.
+        Map<String, String> passwords = new LinkedHashMap<>();
+        for (ConnectionProfile existing : all()) {
+            String password = password(existing.name());
+            if (!password.isEmpty()) {
+                passwords.put(existing.name(), password);
+            }
+        }
+
         Map<String, String> values = new LinkedHashMap<>();
-        values.put(COUNT_KEY, Integer.toString(profiles.size()));
         boolean autoConnectExists = profiles.stream()
                 .anyMatch(profile -> profile.name().equals(autoConnectName));
         values.put(AUTO_CONNECT_KEY, autoConnectExists ? autoConnectName : "");
         for (int index = 0; index < profiles.size(); index++) {
             ConnectionProfile profile = profiles.get(index);
-            String key = PREFIX + index + ".";
+            String key = LIST_PREFIX + index + ".";
             values.put(key + "name", profile.name());
             values.put(key + "transport", profile.transport());
             values.put(key + "endpoint", profile.endpoint());
             values.put(key + "username", profile.username());
             values.put(key + "command", profile.command());
+            String password = passwords.get(profile.name());
+            if (password != null) {
+                values.put(key + "password", password);
+            }
         }
         settings.replaceSection(PREFIX, values);
     }
@@ -85,7 +117,8 @@ public final class ConnectionProfiles {
      * format could hold, so upgrading users keep their server.
      */
     public void migrateSingleConnection() {
-        if (settings.getInt(COUNT_KEY, 0) > 0) {
+        if (!all().isEmpty()) {
+            adoptImportedPassword();
             return;
         }
         String endpoint = settings.get("webservice.endpoint", "");
@@ -102,6 +135,24 @@ public final class ConnectionProfiles {
         // Older versions connected on start whenever a RemoteBox profile was loaded.
         String autoConnect = settings.getBoolean("profile.autoload", true) ? profile.name() : "";
         replaceAll(List.of(profile), autoConnect);
+        adoptImportedPassword();
+    }
+
+    /**
+     * Moves a password imported from RemoteBox into the profile it belongs to. The
+     * import runs while seeding the settings, before any profile exists.
+     */
+    private void adoptImportedPassword() {
+        String imported = settings.get(ApplicationSettings.IMPORTED_PASSWORD_KEY, "");
+        if (imported.isEmpty()) {
+            return;
+        }
+        String endpoint = settings.get("webservice.endpoint", "");
+        all().stream()
+                .filter(profile -> profile.webService() && profile.endpoint().equals(endpoint))
+                .findFirst()
+                .ifPresent(profile -> storePassword(profile.name(), imported));
+        settings.remove(ApplicationSettings.IMPORTED_PASSWORD_KEY);
     }
 
     /** Remembers the profile the user last connected with. */

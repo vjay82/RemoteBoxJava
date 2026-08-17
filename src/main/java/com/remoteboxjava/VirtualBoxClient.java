@@ -3,6 +3,7 @@ package com.remoteboxjava;
 import com.remoteboxjava.VBoxManageClient.VBoxException;
 
 import java.util.List;
+import java.util.function.Consumer;
 
 /**
  * Common abstraction for local VBoxManage and RemoteBox-compatible web-service connections.
@@ -11,6 +12,17 @@ public interface VirtualBoxClient extends AutoCloseable {
     String version() throws VBoxException;
 
     List<VirtualMachine> listMachines() throws VBoxException;
+
+    /**
+     * Loads the guest list and reports intermediate results as they become
+     * available, so the UI can render before every per-guest field has arrived.
+     * The consumer is called from the calling thread.
+     */
+    default List<VirtualMachine> listMachines(Consumer<List<VirtualMachine>> progress) throws VBoxException {
+        List<VirtualMachine> machines = listMachines();
+        progress.accept(machines);
+        return machines;
+    }
 
     void start(VirtualMachine machine) throws VBoxException;
 

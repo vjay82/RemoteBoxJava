@@ -10,6 +10,9 @@ import com.sun.jna.platform.win32.WinUser.WNDENUMPROC;
 import com.sun.jna.win32.StdCallLibrary;
 import com.sun.jna.win32.W32APIOptions;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.util.Locale;
 import java.util.function.Consumer;
 
@@ -25,6 +28,7 @@ import java.util.function.Consumer;
  */
 final class MstscSecurityPrompt {
 
+    private static final Logger LOG = LogManager.getLogger(MstscSecurityPrompt.class);
     private static final String DIALOG_CLASS = "#32770";
     /** Control identifiers are stable across Windows display languages. */
     private static final int CLIPBOARD_CHECKBOX = 16333;
@@ -80,8 +84,11 @@ final class MstscSecurityPrompt {
             try {
                 if (new MstscSecurityPrompt(host).confirm(seconds)) {
                     logger.accept("Confirmed the Remote Desktop security prompt for " + host + ".");
+                } else {
+                    LOG.debug("No Remote Desktop security prompt for {} appeared within {} s.", host, seconds);
                 }
             } catch (RuntimeException | UnsatisfiedLinkError | NoClassDefFoundError exception) {
+                LOG.warn("Could not confirm the Remote Desktop security prompt for {}.", host, exception);
                 logger.accept("Could not confirm the Remote Desktop security prompt: " + exception);
             }
         }, "mstsc-security-prompt");
@@ -102,6 +109,7 @@ final class MstscSecurityPrompt {
                 Thread.sleep(POLL_INTERVAL_MILLIS);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
+                LOG.debug("Waiting for the Remote Desktop security prompt was interrupted.");
                 return false;
             }
         }

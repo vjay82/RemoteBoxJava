@@ -86,6 +86,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 /**
  * Java Swing RemoteBox-style VirtualBox client.
  *
@@ -94,6 +97,7 @@ import java.util.Optional;
  * {@code ssh user@example.com VBoxManage}.</p>
  */
 public final class RemoteBoxApplication extends JFrame {
+    private static final Logger LOG = LogManager.getLogger(RemoteBoxApplication.class);
     private static final String APP_NAME = "RemoteBox Java";
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final String[] TRANSPORT_LABELS = {"RemoteBox Web Service", "Local / SSH VBoxManage"};
@@ -123,14 +127,27 @@ public final class RemoteBoxApplication extends JFrame {
     private boolean busy;
     private long connectionGeneration;
     private long snapshotPreviewGeneration;
+    private String snapshotPreviewMachineId;
     private long hostMemoryGeneration;
     private long machineRefreshGeneration;
     private boolean machineRefreshRunning;
+    private List<VirtualMachine> shownMachines = List.of();
 
     public static void main(String[] args) {
+        // Only the standalone launcher owns the log4j2 configuration; an embedding
+        // host such as autoMATE has already configured it for the whole process.
+        Logging.configure();
+        // Only the standalone launcher may claim this; a host keeps its own handler.
+        Thread.setDefaultUncaughtExceptionHandler((thread, failure) ->
+                LOG.error("Uncaught exception on thread {}.", thread.getName(), failure));
+        long started = System.nanoTime();
+        LOG.info("RemoteBox starting (Java {} on {}).", System.getProperty("java.version"),
+                System.getProperty("os.name"));
         // The first run may probe WSL for a RemoteBox installation, so load before the UI starts.
         ApplicationSettings.shared();
+        LOG.info("Settings loaded after {}.", seconds(System.nanoTime() - started));
         applyTaskbarIcon();
+        LOG.info("Taskbar icon applied after {}.", seconds(System.nanoTime() - started));
         RemoteBox.showWindow(true);
     }
 
@@ -143,13 +160,14 @@ public final class RemoteBoxApplication extends JFrame {
                     taskbar.setIconImage(AppIcon.render(256));
                 }
             }
-        } catch (UnsupportedOperationException | SecurityException ignored) {
-            // The window icon remains the fallback.
+        } catch (UnsupportedOperationException | SecurityException exception) {
+            LOG.debug("The platform has no taskbar icon support; using the window icon.", exception);
         }
     }
 
     public RemoteBoxApplication() {
         super("RemoteBox");
+        long constructionStarted = System.nanoTime();
         // Disposing instead of exiting keeps an embedding host application alive.
         setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
         setIconImages(AppIcon.windowIcons());
@@ -206,6 +224,7 @@ public final class RemoteBoxApplication extends JFrame {
             appendLog(preferences.importReport().summary());
         }
         updateActionState();
+        LOG.info("Window built in {}.", seconds(System.nanoTime() - constructionStarted));
         connectStartupProfile();
         SwingUtilities.invokeLater(this::showImportNotice);
     }
@@ -401,44 +420,39 @@ public final class RemoteBoxApplication extends JFrame {
             return;
         }
 
-        // Web-service profiles need a password; reuse RemoteBox's stored one when it fits.
-        connectionStatus.setText("Connecting to '" + profile.name() + "'…");
-        runBackground("Loading the RemoteBox password", () -> {
-            try {
-                return RemoteBoxProfileReader.loadAutoConnectProfile();
-            } catch (VBoxException exception) {
-                return Optional.<RemoteBoxProfileReader.Profile>empty();
-            }
-        }, stored -> {
-            if (stored.isEmpty() || !stored.get().endpoint().equals(profile.endpoint())) {
-                appendLog("No saved password for '" + profile.name() + "'.");
-                connectionStatus.setText("Profile '" + profile.name() + "' — click Connect and enter the password");
-                return;
-            }
-            RemoteBoxProfileReader.Profile remoteBoxProfile = stored.get();
-            char[] password = remoteBoxProfile.password();
-            remoteBoxProfile.clearPassword();
-            appendLog("Connecting to profile '" + profile.name() + "' with the RemoteBox password.");
-            SwingUtilities.invokeLater(() -> connectUsing(profile, password, false));
-        });
+        // Web-service profiles need a password. It is imported from RemoteBox once, on
+        // the very first start, and kept encrypted; probing WSL again on every start
+        // cost more than the whole connect.
+        char[] password = SecretStore.reveal(profiles.password(profile.name()));
+        if (password.length == 0) {
+            appendLog("No saved password for '" + profile.name() + "'.");
+            connectionStatus.setText("Profile '" + profile.name() + "' — click Connect and enter the password");
+            return;
+        }
+        appendLog("Connecting to profile '" + profile.name() + "' with the saved password.");
+        connectUsing(profile, password, false);
     }
 
     private void connect(String transport, String command, String endpoint, String username, char[] password,
-                         boolean showSuccessMessage) {
+                         boolean showSuccessMessage, String protectedPassword, String profileName) {
         long generation = ++connectionGeneration;
         runBackground("Connecting to VirtualBox", () -> {
             VirtualBoxClient connectedClient = null;
             try {
+                long started = System.nanoTime();
                 connectedClient = "web-service".equals(transport)
                         ? new VirtualBoxWebServiceClient(endpoint, username, password)
                         : new VBoxManageClient(command);
-                return new ConnectedClient(connectedClient, connectedClient.version(), transport, endpoint, command);
+                long authenticated = System.nanoTime();
+                String version = connectedClient.version();
+                return new ConnectedClient(connectedClient, version, transport, endpoint, command,
+                        authenticated - started, System.nanoTime() - authenticated);
             } catch (Exception exception) {
                 if (connectedClient != null) {
                     try {
                         connectedClient.close();
-                    } catch (Exception ignored) {
-                        // Preserve the original connection failure.
+                    } catch (Exception closeFailure) {
+                        LOG.debug("Closing the half-open connection failed.", closeFailure);
                     }
                 }
                 throw exception;
@@ -449,15 +463,21 @@ public final class RemoteBoxApplication extends JFrame {
             if (generation != connectionGeneration) {
                 try {
                     connection.client().close();
-                } catch (VBoxException ignored) {
-                    // A cancelled connection must not replace a newer one.
+                } catch (VBoxException exception) {
+                    LOG.debug("Closing a superseded connection failed.", exception);
                 }
                 return;
             }
             client = connection.client();
             connectionStatus.setText("Connected — VirtualBox " + connection.version());
             refreshTimer.start();
-            appendLog("Connected using: " + connection.description());
+            if (!protectedPassword.isEmpty()) {
+                profiles.storePassword(profileName, protectedPassword);
+                appendLog("Saved the password, encrypted for this Windows account.");
+            }
+            appendLog("Connected using: " + connection.description()
+                    + " (sign-in " + seconds(connection.logonNanos())
+                    + ", version " + seconds(connection.versionNanos()) + ")");
             if (showSuccessMessage) {
                 JOptionPane.showMessageDialog(this, "Connected to VirtualBox " + connection.version() + ".", APP_NAME,
                         JOptionPane.INFORMATION_MESSAGE);
@@ -470,6 +490,7 @@ public final class RemoteBoxApplication extends JFrame {
         refreshTimer.stop();
         connectionGeneration++;
         snapshotPreviewGeneration++;
+        snapshotPreviewMachineId = null;
         hostMemoryGeneration++;
         machineRefreshGeneration++;
         VirtualBoxClient previousClient = client;
@@ -488,6 +509,7 @@ public final class RemoteBoxApplication extends JFrame {
             try {
                 previousClient.close();
             } catch (Exception exception) {
+                LOG.warn("Disconnect cleanup failed.", exception);
                 SwingUtilities.invokeLater(
                         () -> appendLog("Disconnect cleanup failed: " + exception.getMessage()));
             }
@@ -496,6 +518,7 @@ public final class RemoteBoxApplication extends JFrame {
         closer.start();
 
         appendLog("Disconnected.");
+        shownMachines = List.of();
         machineModel.setMachines(List.of());
         machineTree.clearSelection();
         machineTree.expandRow(0);
@@ -532,6 +555,7 @@ public final class RemoteBoxApplication extends JFrame {
                 try {
                     showHostMemory(get());
                 } catch (Exception exception) {
+                    LOG.warn("Reading the host memory failed.", exception);
                     serverMemoryBar.setValue(0);
                     serverMemoryBar.setString("Server Memory — unavailable");
                     serverMemoryBar.setToolTipText(errorMessage(exception));
@@ -561,6 +585,7 @@ public final class RemoteBoxApplication extends JFrame {
         if (!requireConnection()) {
             return;
         }
+        invalidateSnapshotPreview();
         refreshMachines(true);
         refreshHostMemory();
     }
@@ -581,6 +606,7 @@ public final class RemoteBoxApplication extends JFrame {
         }
         String selectedId = selectedMachine() == null ? null : selectedMachine().id();
         long generation = ++machineRefreshGeneration;
+        long started = System.nanoTime();
         machineRefreshRunning = true;
 
         // Only announce the refresh when the server is slow enough to notice.
@@ -591,7 +617,13 @@ public final class RemoteBoxApplication extends JFrame {
         new SwingWorker<List<VirtualMachine>, Void>() {
             @Override
             protected List<VirtualMachine> doInBackground() throws Exception {
-                return refreshingClient.listMachines();
+                return refreshingClient.listMachines(partial -> SwingUtilities.invokeLater(() -> {
+                    if (generation == machineRefreshGeneration && client == refreshingClient) {
+                        indicator.stop();
+                        LOG.info("Listed {} guests in {}.", partial.size(), seconds(System.nanoTime() - started));
+                        showMachines(partial, selectedId);
+                    }
+                }));
             }
 
             @Override
@@ -603,16 +635,15 @@ public final class RemoteBoxApplication extends JFrame {
                 }
                 try {
                     List<VirtualMachine> machines = get();
-                    machineModel.setMachines(machines);
-                    expandGuestFolders();
-                    restoreSelection(selectedId);
-                    machineCountLabel.setText(machines.size() + (machines.size() == 1 ? " guest" : " guests"));
-                    updateSelection();
+                    LOG.info("Guest list complete after {} ({} guests).", seconds(System.nanoTime() - started),
+                            machines.size());
+                    showMachines(machines, selectedId);
                     if (reportErrors) {
                         appendLog("Guest list refreshed (" + machines.size() + " guests).");
                     }
                 } catch (Exception exception) {
                     Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+                    LOG.warn("Refreshing the guest list failed.", cause);
                     machineCountLabel.setText("Refresh failed");
                     appendLog("Refreshing the guest list failed: " + cause.getMessage());
                     if (reportErrors) {
@@ -621,6 +652,19 @@ public final class RemoteBoxApplication extends JFrame {
                 }
             }
         }.execute();
+    }
+
+    private void showMachines(List<VirtualMachine> machines, String selectedId) {        machineCountLabel.setText(machines.size() + (machines.size() == 1 ? " guest" : " guests"));
+        if (machines.equals(shownMachines)) {
+            // Rebuilding the tree collapses folders and flickers, so an unchanged
+            // periodic refresh must leave it alone.
+            return;
+        }
+        shownMachines = List.copyOf(machines);
+        machineModel.setMachines(machines);
+        expandGuestFolders();
+        restoreSelection(selectedId);
+        updateSelection();
     }
 
     private void refreshMachines() {
@@ -686,9 +730,16 @@ public final class RemoteBoxApplication extends JFrame {
     }
 
     private void connectUsing(ConnectionProfile profile, char[] password, boolean showSuccessMessage) {
+        connectUsing(profile, password, showSuccessMessage, false);
+    }
+
+    private void connectUsing(ConnectionProfile profile, char[] password, boolean showSuccessMessage,
+                              boolean rememberPassword) {
         disconnect();
+        // connect() wipes the array, so protect it while it is still readable.
+        String protectedPassword = rememberPassword ? SecretStore.protect(password) : "";
         connect(profile.transport(), profile.command(), profile.endpoint(), profile.username(), password,
-                showSuccessMessage);
+                showSuccessMessage, protectedPassword, profile.name());
     }
 
     /**
@@ -825,7 +876,8 @@ public final class RemoteBoxApplication extends JFrame {
     }
 
     /**
-     * Web-service profiles need a password, which is deliberately not stored.
+     * Web-service profiles need a password. It is only stored when the user asks
+     * for it, and then only encrypted for the current Windows account.
      */
     private void connectWithPasswordPrompt(ConnectionProfile profile) {
         if (!profile.webService()) {
@@ -833,14 +885,16 @@ public final class RemoteBoxApplication extends JFrame {
             return;
         }
         JPasswordField password = new JPasswordField(20);
-        JPanel content = formPanel(new String[]{"Profile", "Server URL", "Username", "Password"},
+        JCheckBox remember = new JCheckBox("Remember this password", false);
+        remember.setEnabled(SecretStore.isSupported());
+        JPanel content = formPanel(new String[]{"Profile", "Server URL", "Username", "Password", ""},
                 new Component[]{new JLabel(profile.name()), new JLabel(profile.endpoint()),
-                        new JLabel(profile.username()), password});
+                        new JLabel(profile.username()), password, remember});
         if (JOptionPane.showConfirmDialog(this, content, "Connect to " + profile.name(),
                 JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION) {
             return;
         }
-        connectUsing(profile, password.getPassword(), true);
+        connectUsing(profile, password.getPassword(), true, remember.isSelected());
     }
 
     /**
@@ -1029,6 +1083,7 @@ public final class RemoteBoxApplication extends JFrame {
             Files.writeString(destination, logArea.getText(), java.nio.charset.StandardCharsets.UTF_8);
             appendLog("Saved message log to " + destination + ".");
         } catch (IOException exception) {
+            LOG.warn("Saving the message log to {} failed.", destination, exception);
             showError("Could not save the message log to " + destination + ".\n\n" + exception.getMessage());
         }
     }
@@ -1615,6 +1670,7 @@ public final class RemoteBoxApplication extends JFrame {
         try {
             return loader.load();
         } catch (Exception exception) {
+            LOG.warn("Loading the '{}' settings page failed.", page, exception);
             errors.putIfAbsent(page, errorMessage(exception));
             return fallback.get();
         }
@@ -3338,6 +3394,7 @@ public final class RemoteBoxApplication extends JFrame {
                 return name.getText().trim();
             }, snapshotName -> {
                 appendLog("Created snapshot '" + snapshotName + "' for " + machine.name() + ".");
+                invalidateSnapshotPreview();
                 refreshMachines();
             });
         }
@@ -3388,6 +3445,7 @@ public final class RemoteBoxApplication extends JFrame {
                 return selected;
             }, snapshot -> {
                 appendLog((delete ? "Deleted" : "Restored") + " snapshot '" + snapshot + "' for " + machine.name() + ".");
+                invalidateSnapshotPreview();
                 refreshMachines();
             });
         });
@@ -3479,6 +3537,7 @@ public final class RemoteBoxApplication extends JFrame {
                     success.accept(get());
                 } catch (Exception exception) {
                     Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+                    LOG.warn("{} failed.", taskName, cause);
                     appendLog(taskName + " failed: " + cause.getMessage());
                     showError(taskName + " failed.\n\n" + cause.getMessage());
                 }
@@ -3496,18 +3555,26 @@ public final class RemoteBoxApplication extends JFrame {
     }
 
     private void updateSnapshotPreview(VirtualMachine machine) {
+        if (machine != null && machine.id().equals(snapshotPreviewMachineId)) {
+            // Snapshots only change through explicit actions, so neither the periodic
+            // refresh nor the two-stage guest list must re-walk the snapshot tree.
+            return;
+        }
         long generation = ++snapshotPreviewGeneration;
         if (machine == null) {
+            snapshotPreviewMachineId = null;
             snapshotsArea.setText("Select a guest to view its snapshots.");
             return;
         }
         VirtualBoxClient snapshotClient = client;
         if (snapshotClient == null) {
+            snapshotPreviewMachineId = null;
             snapshotsArea.setText("Connect to a VirtualBox host to view snapshots.");
             return;
         }
 
         String machineId = machine.id();
+        snapshotPreviewMachineId = machineId;
         snapshotsArea.setText("Loading snapshots for " + machine.name() + "…");
         new SwingWorker<List<String>, Void>() {
             @Override
@@ -3533,11 +3600,18 @@ public final class RemoteBoxApplication extends JFrame {
                     snapshotsArea.setText(text);
                     snapshotsArea.setCaretPosition(0);
                 } catch (Exception exception) {
+                    snapshotPreviewMachineId = null;
                     Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+                    LOG.warn("Loading the snapshots of {} failed.", machine.name(), cause);
                     snapshotsArea.setText("Could not load snapshots: " + cause.getMessage());
                 }
             }
         }.execute();
+    }
+
+    /** Forces the next preview update to re-read the snapshot tree. */
+    private void invalidateSnapshotPreview() {
+        snapshotPreviewMachineId = null;
     }
 
     private void updateActionState() {
@@ -3594,9 +3668,15 @@ public final class RemoteBoxApplication extends JFrame {
     }
 
     private void appendLog(String message) {
+        LOG.info(message);
         logArea.append("[" + LocalDateTime.now().format(LOG_TIME) + "] " + message + System.lineSeparator());
         trimLog();
         logArea.setCaretPosition(logArea.getDocument().getLength());
+    }
+
+    /** Formats a duration for the log and the status messages. */
+    private static String seconds(long nanos) {
+        return String.format(java.util.Locale.ROOT, "%.1f s", nanos / 1_000_000_000.0);
     }
 
     /** An unbounded log slows the text area down over a long-running session. */
@@ -3607,12 +3687,14 @@ public final class RemoteBoxApplication extends JFrame {
         }
         try {
             logArea.replaceRange("", 0, logArea.getLineEndOffset(lines - MAX_LOG_LINES - 1));
-        } catch (javax.swing.text.BadLocationException ignored) {
+        } catch (javax.swing.text.BadLocationException exception) {
+            LOG.debug("Could not trim the message log, clearing it instead.", exception);
             logArea.setText("");
         }
     }
 
     private void showError(String message) {
+        LOG.warn("Reported to the user: {}", message.replace(System.lineSeparator(), " "));
         JOptionPane.showMessageDialog(this, message, APP_NAME, JOptionPane.ERROR_MESSAGE);
     }
 
@@ -3973,13 +4055,15 @@ public final class RemoteBoxApplication extends JFrame {
     }
 
     private static String machineDetails(VirtualMachine machine, boolean includeExtended) {
+        // The guest list renders before the configuration fields arrive.
+        String pending = "Loading…";
         String details = """
                 Name:          %s
                 UUID:          %s
                 State:         %s
                 Operating OS:  %s
-                Memory:        %d MB
-                Processors:    %d
+                Memory:        %s
+                Processors:    %s
                 Group:         %s
                 VRDE Port:     %s
 
@@ -3989,12 +4073,16 @@ public final class RemoteBoxApplication extends JFrame {
                 machine.name(),
                 machine.id(),
                 machine.displayState(),
-                machine.osType(),
-                machine.memoryMb(),
-                machine.cpuCount(),
+                machine.hasDetails() ? machine.osType() : pending,
+                machine.hasDetails() ? machine.memoryMb() + " MB" : pending,
+                machine.hasDetails() ? Integer.toString(machine.cpuCount()) : pending,
                 machine.displayGroup(),
-                machine.vrdePort().isBlank() ? "Not configured" : machine.vrdePort(),
-                machine.description().isBlank() ? "(No description)" : machine.description()
+                machine.hasDetails()
+                        ? (machine.vrdePort().isBlank() ? "Not configured" : machine.vrdePort())
+                        : pending,
+                machine.hasDetails()
+                        ? (machine.description().isBlank() ? "(No description)" : machine.description())
+                        : pending
         );
         if (!includeExtended) {
             return details;
@@ -4026,19 +4114,22 @@ public final class RemoteBoxApplication extends JFrame {
     }
 
     private record ConnectedClient(VirtualBoxClient client, String version, String transport,
-                                   String endpoint, String command) {
+                                   String endpoint, String command, long logonNanos, long versionNanos) {
         String description() {
             return "web-service".equals(transport) ? endpoint : command;
         }
     }
 
     static void installLookAndFeel() {
+        long started = System.nanoTime();
         try (InputStream theme = RemoteBoxApplication.class.getResourceAsStream("/MiraDark.properties")) {
             if (theme == null) {
                 throw new IllegalStateException("MiraDark.properties is missing from the application resources.");
             }
             UIManager.setLookAndFeel(new FlatPropertiesLaf("Mira Dark", theme));
+            LOG.info("Look and feel installed in {}.", seconds(System.nanoTime() - started));
         } catch (Exception exception) {
+            LOG.error("Could not install the Mira Dark look and feel.", exception);
             throw new IllegalStateException("Could not install the autoMATE Mira Dark look and feel.", exception);
         }
     }

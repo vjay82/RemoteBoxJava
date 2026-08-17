@@ -2,6 +2,9 @@ package com.remoteboxjava;
 
 import com.remoteboxjava.VBoxManageClient.VBoxException;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -12,6 +15,10 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -25,6 +32,7 @@ import java.util.concurrent.TimeUnit;
  * WSL distribution when running on Windows.</p>
  */
 public final class RemoteBoxProfileReader {
+    private static final Logger LOG = LogManager.getLogger(RemoteBoxProfileReader.class);
     private static final char FIELD_SEPARATOR = 7;
     private static final String CONFIG_FILE = "remotebox.conf";
     private static final String PROFILES_FILE = "remotebox-profiles.conf";
@@ -34,57 +42,77 @@ public final class RemoteBoxProfileReader {
     }
 
     /**
-     * Loads the profile selected by RemoteBox's {@code AUTOCONNPROF} setting.
-     *
-     * @return the selected profile, or empty when no RemoteBox installation has one
-     */
-    public static Optional<Profile> loadAutoConnectProfile() throws VBoxException {
-        for (Location location : locations()) {
-            Optional<Profile> profile = autoConnectProfile(location);
-            if (profile.isPresent()) {
-                return profile;
-            }
-        }
-        return Optional.empty();
-    }
-
-    private static Optional<Profile> autoConnectProfile(Location location) throws VBoxException {
-        Optional<String> configuration = location.read(CONFIG_FILE);
-        if (configuration.isEmpty()) {
-            return Optional.empty();
-        }
-        String profileName = value(configuration.get(), "AUTOCONNPROF", "").trim();
-        if (profileName.isBlank()) {
-            return Optional.empty();
-        }
-        Optional<String> profiles = location.read(PROFILES_FILE);
-        return profiles.isEmpty() ? Optional.empty() : findProfile(profiles.get(), profileName);
-    }
-
-    /**
      * Reads the settings worth importing into this application's own configuration.
+     * Only the first start does this, so the cost of probing WSL is paid once.
      */
     public static Optional<ImportedSettings> importSettings() {
-        for (Location location : locations()) {
-            Optional<String> configuration = location.read(CONFIG_FILE);
+        List<Location> locations = locations();
+        List<Optional<String>> configurations = readInParallel(locations, CONFIG_FILE);
+        for (int index = 0; index < locations.size(); index++) {
+            Optional<String> configuration = configurations.get(index);
             if (configuration.isEmpty()) {
                 continue;
             }
+            Location location = locations.get(index);
+            LOG.info("Found a RemoteBox configuration at {}.", location.describe());
             String profileName = value(configuration.get(), "AUTOCONNPROF", "").trim();
             String endpoint = "";
             String username = "";
+            char[] password = new char[0];
             Optional<String> profiles = location.read(PROFILES_FILE);
             if (profiles.isPresent()) {
                 String[] fields = profileFields(profiles.get(), profileName);
                 if (fields != null) {
                     endpoint = fields[1];
                     username = fields[2];
+                    try {
+                        password = decodePassword(fields[3], fields[4]);
+                    } catch (VBoxException exception) {
+                        // An unreadable password only means the user has to type it once.
+                        LOG.warn("Could not decode the RemoteBox password of profile '{}'.", profileName, exception);
+                    }
                 }
             }
-            return Optional.of(new ImportedSettings(location.describe(), profileName, endpoint, username,
+            return Optional.of(new ImportedSettings(location.describe(), profileName, endpoint, username, password,
                     displaySettings(configuration.get())));
         }
         return Optional.empty();
+    }
+
+    /**
+     * Reads the same file from every candidate location at once. Each WSL location
+     * costs a process start, and running them one after another dominated start-up.
+     */
+    private static List<Optional<String>> readInParallel(List<Location> locations, String fileName) {
+        if (locations.size() < 2) {
+            return locations.stream().map(location -> location.read(fileName)).toList();
+        }
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(locations.size(), 8), runnable -> {
+            Thread worker = new Thread(runnable, "RemoteBox-profile-probe");
+            worker.setDaemon(true);
+            return worker;
+        });
+        try {
+            List<Future<Optional<String>>> futures = locations.stream()
+                    .map(location -> pool.submit(() -> location.read(fileName)))
+                    .toList();
+            List<Optional<String>> contents = new ArrayList<>(futures.size());
+            for (Future<Optional<String>> future : futures) {
+                try {
+                    contents.add(future.get());
+                } catch (ExecutionException exception) {
+                    LOG.debug("Probing a RemoteBox location failed.", exception);
+                    contents.add(Optional.empty());
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    LOG.debug("Probing the RemoteBox locations was interrupted.", exception);
+                    contents.add(Optional.empty());
+                }
+            }
+            return contents;
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     /**
@@ -109,13 +137,6 @@ public final class RemoteBoxProfileReader {
                 defaults.useMstsc(),
                 defaults.autoScale(),
                 defaults.shareClipboard());
-    }
-
-    private static Optional<Profile> findProfile(String profiles, String profileName) throws VBoxException {
-        String[] fields = profileFields(profiles, profileName);
-        return fields == null
-                ? Optional.empty()
-                : Optional.of(new Profile(fields[0], fields[1], fields[2], decodePassword(fields[3], fields[4])));
     }
 
     static String[] profileFields(String profiles, String profileName) {
@@ -206,6 +227,7 @@ public final class RemoteBoxProfileReader {
     }
 
     private static Optional<String> runCommand(List<String> command, Charset charset) {
+        long started = System.nanoTime();
         Path outputFile = null;
         try {
             outputFile = Files.createTempFile("remotebox-command-", ".log");
@@ -216,22 +238,27 @@ public final class RemoteBoxProfileReader {
             if (!process.waitFor(20, TimeUnit.SECONDS)) {
                 process.destroyForcibly();
                 process.waitFor();
+                LOG.warn("{} timed out.", String.join(" ", command));
                 return Optional.empty();
             }
+            LOG.debug("{} exited with {} after {} ms.", String.join(" ", command), process.exitValue(),
+                    (System.nanoTime() - started) / 1_000_000L);
             return process.exitValue() == 0
                     ? Optional.of(Files.readString(outputFile, charset))
                     : Optional.empty();
         } catch (IOException exception) {
+            LOG.debug("Could not run {}.", String.join(" ", command), exception);
             return Optional.empty();
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
+            LOG.debug("{} was interrupted.", String.join(" ", command));
             return Optional.empty();
         } finally {
             if (outputFile != null) {
                 try {
                     Files.deleteIfExists(outputFile);
-                } catch (IOException ignored) {
-                    // The system temporary-file cleanup will handle a temporarily locked file.
+                } catch (IOException exception) {
+                    LOG.debug("Could not delete the temporary output file {}.", outputFile, exception);
                 }
             }
         }
@@ -289,6 +316,7 @@ public final class RemoteBoxProfileReader {
                         ? Optional.of(Files.readString(path, StandardCharsets.UTF_8))
                         : Optional.empty();
             } catch (IOException exception) {
+                LOG.debug("Could not read {}.", path, exception);
                 return Optional.empty();
             }
         }
@@ -311,7 +339,8 @@ public final class RemoteBoxProfileReader {
                 command.add("-d");
                 command.add(distribution);
             }
-            command.addAll(List.of("sh", "-lc", "cat \"" + directory + "/" + fileName + "\""));
+            // No login shell: running the user's profile scripts costs seconds per call.
+            command.addAll(List.of("sh", "-c", "cat \"" + directory + "/" + fileName + "\""));
             return runCommand(command, StandardCharsets.UTF_8);
         }
     }
@@ -329,17 +358,9 @@ public final class RemoteBoxProfileReader {
 
     /** RemoteBox values worth copying into this application's own settings. */
     public record ImportedSettings(String source, String profileName, String endpoint, String username,
-                                   DisplaySettings display) {
-    }
-
-    public record Profile(String name, String endpoint, String username, char[] password) {
-        public Profile {
-            password = password.clone();
-        }
-
-        @Override
-        public char[] password() {
-            return password.clone();
+                                   char[] password, DisplaySettings display) {
+        public ImportedSettings {
+            password = password == null ? new char[0] : password.clone();
         }
 
         public void clearPassword() {

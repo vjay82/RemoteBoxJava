@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Template for the standalone launcher only. Logging.configure() copies it to
+    the configuration directory and replaces ${logPath} with the log folder, so
+    the file can be edited there without rebuilding.
+-->
+<configuration status="OFF">
+	<appenders>
+		<RollingRandomAccessFile name="LogFile"
+			fileName="${logPath}RemoteBox.log"
+			filePattern="${logPath}RemoteBox %i.log.gz" append="true">
+			<PatternLayout>
+				<pattern>%d [%t] %-5level %logger{36} - %msg%n</pattern>
+			</PatternLayout>
+			<Policies>
+				<SizeBasedTriggeringPolicy size="5 MB" />
+			</Policies>
+			<DefaultRolloverStrategy max="4" />
+		</RollingRandomAccessFile>
+		<Console name="Console" target="SYSTEM_OUT">
+			<PatternLayout
+				pattern="%d{HH:mm:ss} [%t] %-5level %logger{36} - %msg%n" />
+		</Console>
+	</appenders>
+	<loggers>
+		<root level="debug">
+			<appender-ref ref="LogFile" level="debug" />
+			<appender-ref ref="Console" />
+		</root>
+	</loggers>
+</configuration>
