@@ -16,4 +16,4 @@ if not exist "%JAR%" (
 )
 
 echo Starting RemoteBox Java...
-start "" javaw -jar "%JAR%"
+java -jar "%JAR%"
