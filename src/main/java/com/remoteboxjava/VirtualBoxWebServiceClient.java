@@ -36,6 +36,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
@@ -52,6 +53,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     private static final int SECURITY_PROMPT_TIMEOUT_SECONDS = 10;
     /** The zoom entry only exists once mstsc has connected, which needs the guest to answer. */
     private static final int ZOOM_TIMEOUT_SECONDS = 60;
+    private static final int DISPLAY_CLIENT_SHUTDOWN_SECONDS = 5;
     /**
      * How many SOAP requests the guest-list load may have in flight. Each guest
      * costs several round trips, so a serial load is dominated by network latency;
@@ -86,11 +88,17 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
      */
     private final Map<String, MachineDetails> machineDetails = new ConcurrentHashMap<>();
     /**
+     * Display clients RemoteBox launched, keyed by VM UUID. Power cycling a guest
+     * kills their connection, so they must be closed and reopened around it.
+     */
+    private final Map<String, Process> displayClients = new ConcurrentHashMap<>();
+    /**
      * Older VirtualBox web-service versions predate IMachine drag-and-drop
      * operations. A null value means not yet detected.
      */
     private volatile Boolean dragAndDropSupported;
     private volatile String virtualBoxReference;
+    private volatile ProgressListener progressListener;
 
     public VirtualBoxWebServiceClient(String endpoint, String username, char[] password) throws VBoxException {
         this.endpoint = normalizeEndpoint(endpoint);
@@ -111,6 +119,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             }
         } catch (VBoxException | RuntimeException failure) {
             Arrays.fill(this.password, '\0');
+            listExecutor.shutdownNow();
             throw failure;
         }
     }
@@ -118,6 +127,11 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     private String logon() throws VBoxException {
         return callSingle("IWebsessionManager_logon",
                 element("username", username) + element("password", new String(password)));
+    }
+
+    @Override
+    public void setProgressListener(ProgressListener listener) {
+        this.progressListener = listener;
     }
 
     /**
@@ -421,34 +435,31 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     }
 
     @Override
-    public synchronized void start(VirtualMachine machine) throws VBoxException {
-        String machineReference = findMachine(machine);
-        String session = newSession();
-        boolean locked = false;
-        try {
-            String progress = callSingle("IMachine_launchVMProcess",
-                    element("_this", machineReference)
-                            + element("session", session)
-                            + element("name", "headless")
-                            // VirtualBox 6.1 requires a non-empty environment list.
-                            + element("environmentChanges", "DUMMY=DUMMY"));
-            locked = true;
-            waitForProgress(progress, "start the guest");
-        } finally {
-            if (locked) {
-                unlock(session);
+    public void start(VirtualMachine machine) throws VBoxException {
+        String session;
+        String progress;
+        synchronized (this) {
+            String machineReference = findMachine(machine);
+            session = newSession();
+            try {
+                progress = callSingle("IMachine_launchVMProcess",
+                        element("_this", machineReference)
+                                + element("session", session)
+                                + element("name", "headless")
+                                // VirtualBox 6.1 requires a non-empty environment list.
+                                + element("environmentChanges", "DUMMY=DUMMY"));
+            } catch (VBoxException exception) {
+                release(session);
+                throw exception;
             }
-            release(session);
         }
+        awaitAndUnlock(session, progress, "start the guest");
     }
 
     @Override
-    public synchronized void powerOff(VirtualMachine machine) throws VBoxException {
-        withSession(machine, session -> {
-            String progress = callSingle("IConsole_powerDown", element("_this", session.console()));
-            waitForProgress(progress, "power off the guest");
-            return null;
-        });
+    public void powerOff(VirtualMachine machine) throws VBoxException {
+        withProgressSession(machine, "power off the guest",
+                session -> callSingle("IConsole_powerDown", element("_this", session.console())));
     }
 
     @Override
@@ -460,12 +471,9 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     }
 
     @Override
-    public synchronized void saveState(VirtualMachine machine) throws VBoxException {
-        withSession(machine, session -> {
-            String progress = callSingle("IMachine_saveState", element("_this", session.machine()));
-            waitForProgress(progress, "save the guest state");
-            return null;
-        });
+    public void saveState(VirtualMachine machine) throws VBoxException {
+        withProgressSession(machine, "save the guest state",
+                session -> callSingle("IMachine_saveState", element("_this", session.machine())));
     }
 
     @Override
@@ -501,18 +509,15 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     }
 
     @Override
-    public synchronized void takeSnapshot(VirtualMachine machine, String name, String description) throws VBoxException {
-        withSession(machine, session -> {
-            // takeSnapshot declares the progress object as its [retval], so the web
-            // service returns it in <returnval> and the snapshot UUID in <id>.
-            String progress = callSingle("IMachine_takeSnapshot",
-                    element("_this", session.machine())
-                            + element("name", name)
-                            + element("description", description == null ? "" : description)
-                            + element("pause", "true"));
-            waitForProgress(progress, "take the snapshot");
-            return null;
-        });
+    public void takeSnapshot(VirtualMachine machine, String name, String description) throws VBoxException {
+        // takeSnapshot declares the progress object as its [retval], so the web
+        // service returns it in <returnval> and the snapshot UUID in <id>.
+        withProgressSession(machine, "take the snapshot",
+                session -> callSingle("IMachine_takeSnapshot",
+                        element("_this", session.machine())
+                                + element("name", name)
+                                + element("description", description == null ? "" : description)
+                                + element("pause", "true")));
     }
 
     @Override
@@ -537,27 +542,23 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     }
 
     @Override
-    public synchronized void restoreSnapshot(VirtualMachine machine, String snapshot) throws VBoxException {
-        withSession(machine, session -> {
+    public void restoreSnapshot(VirtualMachine machine, String snapshot) throws VBoxException {
+        withProgressSession(machine, "restore the snapshot", session -> {
             String snapshotReference = callSingle("IMachine_findSnapshot",
                     element("_this", session.machine()) + element("nameOrId", snapshot));
-            String progress = callSingle("IMachine_restoreSnapshot",
+            return callSingle("IMachine_restoreSnapshot",
                     element("_this", session.machine()) + element("snapshot", snapshotReference));
-            waitForProgress(progress, "restore the snapshot");
-            return null;
         });
     }
 
     @Override
-    public synchronized void deleteSnapshot(VirtualMachine machine, String snapshot) throws VBoxException {
-        withSession(machine, session -> {
+    public void deleteSnapshot(VirtualMachine machine, String snapshot) throws VBoxException {
+        withProgressSession(machine, "delete the snapshot", session -> {
             String snapshotReference = callSingle("IMachine_findSnapshot",
                     element("_this", session.machine()) + element("nameOrId", snapshot));
             String snapshotId = property(snapshotReference, "ISnapshot_getId");
-            String progress = callSingle("IMachine_deleteSnapshot",
+            return callSingle("IMachine_deleteSnapshot",
                     element("_this", session.machine()) + element("id", snapshotId));
-            waitForProgress(progress, "delete the snapshot");
-            return null;
         });
     }
 
@@ -1614,22 +1615,9 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         boolean locked = false;
         VBoxException failure = null;
         try {
-            /*
-             * This mirrors RemoteBox 3.7's get_session: an inactive machine
-             * receives a VM lock (which yields a writable machine), while a
-             * running machine is accessed through a Shared lock. In particular,
-             * snapshots must remain available while a guest is running.
-             */
-            String sessionState = property(machineReference, "IMachine_getSessionState");
-            String lockType = "Unlocked".equalsIgnoreCase(sessionState) ? "VM" : "Shared";
-            callMany("IMachine_lockMachine",
-                    element("_this", machineReference)
-                            + element("session", session)
-                            + element("lockType", lockType));
+            lockMachine(machineReference, session);
             locked = true;
-            String writableMachine = callSingle("ISession_getMachine", element("_this", session));
-            String console = callSingle("ISession_getConsole", element("_this", session));
-            return operation.run(new MachineSession(session, writableMachine, console));
+            return operation.run(openSession(session));
         } catch (VBoxException exception) {
             failure = exception;
             throw exception;
@@ -1641,8 +1629,102 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         }
     }
 
+    /**
+     * Starts a guest operation under the client lock but waits for its progress
+     * object without holding it. Saving state or deleting a snapshot can take
+     * minutes, and the guest list must stay refreshable meanwhile.
+     *
+     * @param operation returns the progress reference of the started operation
+     */
+    private void withProgressSession(VirtualMachine machine, String action, SessionOperation<String> operation)
+            throws VBoxException {
+        String session;
+        String progress;
+        synchronized (this) {
+            String machineReference = findMachine(machine);
+            session = newSession();
+            boolean locked = false;
+            try {
+                lockMachine(machineReference, session);
+                locked = true;
+                progress = operation.run(openSession(session));
+            } catch (VBoxException exception) {
+                if (locked) {
+                    unlockAfter(session, exception);
+                }
+                release(session);
+                throw exception;
+            }
+        }
+        awaitAndUnlock(session, progress, action);
+    }
+
+    private void awaitAndUnlock(String session, String progress, String action) throws VBoxException {
+        VBoxException failure = null;
+        try {
+            waitForProgress(progress, action);
+        } catch (VBoxException exception) {
+            failure = exception;
+            throw exception;
+        } finally {
+            synchronized (this) {
+                try {
+                    unlockAfter(session, failure);
+                } finally {
+                    release(session);
+                }
+            }
+        }
+    }
+
+    /*
+     * This mirrors RemoteBox 3.7's get_session: an inactive machine receives a VM
+     * lock (which yields a writable machine), while a running machine is accessed
+     * through a Shared lock. In particular, snapshots must remain available while
+     * a guest is running.
+     */
+    private void lockMachine(String machineReference, String session) throws VBoxException {
+        String sessionState = property(machineReference, "IMachine_getSessionState");
+        String lockType = "Unlocked".equalsIgnoreCase(sessionState) ? "VM" : "Shared";
+        callMany("IMachine_lockMachine",
+                element("_this", machineReference)
+                        + element("session", session)
+                        + element("lockType", lockType));
+    }
+
+    private MachineSession openSession(String session) throws VBoxException {
+        return new MachineSession(session,
+                callSingle("ISession_getMachine", element("_this", session)),
+                callSingle("ISession_getConsole", element("_this", session)));
+    }
+
     private void unlock(String session) throws VBoxException {
-        callMany("ISession_unlockMachine", element("_this", session));
+        // saveState and powerDown end the VM process, so VirtualBox releases the
+        // lock itself; unlocking again fails with "The session is not locked".
+        if (isSessionUnlocked(session)) {
+            return;
+        }
+        try {
+            callMany("ISession_unlockMachine", element("_this", session));
+        } catch (VBoxException exception) {
+            if (!isSessionUnlocked(session)) {
+                throw exception;
+            }
+            LOG.debug("The guest session was already unlocked by VirtualBox.", exception);
+        }
+    }
+
+    private boolean isSessionUnlocked(String session) {
+        try {
+            String state = property(session, "ISession_getState").trim();
+            return state.isEmpty()
+                    || "Null".equalsIgnoreCase(state)
+                    || "Unlocked".equalsIgnoreCase(state)
+                    || "Unlocking".equalsIgnoreCase(state);
+        } catch (VBoxException exception) {
+            LOG.debug("Reading the session state failed, so the lock is assumed to be held.", exception);
+            return false;
+        }
     }
 
     /** Keeps the failure that closed the session while still reporting the failed unlock. */
@@ -1654,9 +1736,23 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
             if (failure != null) {
                 failure.addSuppressed(unlockFailure);
             } else {
-                release(session);
                 throw unlockFailure;
             }
+        }
+    }
+
+    /** Hands the current step and completion of a running operation to the UI. */
+    private void reportProgress(String progress) {
+        ProgressListener listener = progressListener;
+        if (listener == null) {
+            return;
+        }
+        try {
+            String operation = property(progress, "IProgress_getOperationDescription").trim();
+            listener.onProgress(operation.isEmpty() ? null : operation,
+                    integerProperty(progress, "IProgress_getPercent", -1));
+        } catch (VBoxException exception) {
+            LOG.debug("Reading the operation progress failed.", exception);
         }
     }
 
@@ -1671,6 +1767,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
                 if (System.nanoTime() >= deadline) {
                     throw new VBoxException("Timed out waiting for VirtualBox to " + action + ".");
                 }
+                reportProgress(progress);
                 // Let the server block instead of polling it in a tight loop.
                 callMany("IProgress_waitForCompletion",
                         element("_this", progress) + element("timeout", "1000"));
@@ -2178,7 +2275,7 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         RemoteBoxProfileReader.DisplaySettings settings = ApplicationSettings.shared().displaySettings();
         boolean vnc = extensionPack.toLowerCase(Locale.ROOT).contains("vnc");
         if (!vnc && settings.useMstsc()) {
-            String command = start(mstscProcess(machine.name(), host, port, settings));
+            String command = start(machine, mstscProcess(machine.name(), host, port, settings));
             if (settings.shareClipboard()) {
                 MstscSecurityPrompt.confirmInBackground(host, SECURITY_PROMPT_TIMEOUT_SECONDS);
             }
@@ -2215,18 +2312,49 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         if (command.isEmpty()) {
             throw new VBoxException("No RemoteBox display client is configured.");
         }
-        return start(new ProcessBuilder(command));
+        return start(machine, new ProcessBuilder(command));
     }
 
-    private static String start(ProcessBuilder process) throws VBoxException {
+    private String start(VirtualMachine machine, ProcessBuilder process) throws VBoxException {
         List<String> command = process.command();
         try {
-            process.start();
+            displayClients.put(machine.id(), process.start());
             return String.join(" ", command);
         } catch (IOException exception) {
             throw new VBoxException("Could not start the configured RemoteBox display client: "
                     + command.get(0), exception);
         }
+    }
+
+    @Override
+    public boolean isDisplayOpen(VirtualMachine machine) {
+        Process client = displayClients.get(machine.id());
+        if (client == null) {
+            return false;
+        }
+        if (client.isAlive()) {
+            return true;
+        }
+        displayClients.remove(machine.id(), client);
+        return false;
+    }
+
+    @Override
+    public void closeDisplay(VirtualMachine machine) {
+        Process client = displayClients.remove(machine.id());
+        if (client == null || !client.isAlive()) {
+            return;
+        }
+        client.destroy();
+        try {
+            if (!client.waitFor(DISPLAY_CLIENT_SHUTDOWN_SECONDS, TimeUnit.SECONDS)) {
+                client.destroyForcibly();
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            client.destroyForcibly();
+        }
+        LOG.debug("Closed the display client of {}.", machine.name());
     }
 
     private static ProcessBuilder mstscProcess(String machineName, String host, int port,
@@ -2243,11 +2371,20 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     }
 
     private static String substitute(String token, Map<String, String> placeholders) {
-        String result = token;
-        for (Map.Entry<String, String> placeholder : placeholders.entrySet()) {
-            result = result.replace(placeholder.getKey(), placeholder.getValue());
+        StringBuilder result = new StringBuilder(token.length());
+        for (int index = 0; index < token.length(); ) {
+            String replacement = token.charAt(index) == '%' && index + 1 < token.length()
+                    ? placeholders.get(token.substring(index, index + 2))
+                    : null;
+            if (replacement == null) {
+                result.append(token.charAt(index));
+                index++;
+            } else {
+                result.append(replacement);
+                index += 2;
+            }
         }
-        return result;
+        return result.toString();
     }
 
     /**

@@ -517,7 +517,7 @@ public final class ApplicationSettings {
                 return readString();
             }
             int start = position;
-            while (position < text.length() && ",}\n\r\t ".indexOf(text.charAt(position)) < 0) {
+            while (position < text.length() && ",}]\n\r\t ".indexOf(text.charAt(position)) < 0) {
                 position++;
             }
             String literal = text.substring(start, position).trim();

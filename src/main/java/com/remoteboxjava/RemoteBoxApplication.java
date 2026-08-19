@@ -1,5 +1,6 @@
 package com.remoteboxjava;
 
+import com.formdev.flatlaf.FlatLaf;
 import com.formdev.flatlaf.FlatPropertiesLaf;
 import com.remoteboxjava.VBoxManageClient.VBoxException;
 
@@ -74,6 +75,7 @@ import java.awt.event.WindowEvent;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Proxy;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -111,6 +113,29 @@ public final class RemoteBoxApplication extends JFrame {
     private static final int MAX_LOG_LINES = 2_000;
     /** PS/2 press scancodes of F1 to F12; the release code is the press code plus 128. */
     private static final int[] FUNCTION_KEY_CODES = {59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88};
+    /**
+     * Stands in for the connection while none is open. Roughly ninety call sites
+     * reach for the client from a background worker, and the user can disconnect
+     * while any of them is still in flight; going through a stand-in turns that
+     * race into a readable message instead of a NullPointerException, and covers
+     * every method of the interface including ones added later.
+     */
+    private static final VirtualBoxClient DISCONNECTED = (VirtualBoxClient) Proxy.newProxyInstance(
+            VirtualBoxClient.class.getClassLoader(), new Class<?>[]{VirtualBoxClient.class},
+            (proxy, method, arguments) -> {
+                switch (method.getName()) {
+                    case "close":
+                        return null;
+                    case "toString":
+                        return "not connected";
+                    case "hashCode":
+                        return System.identityHashCode(proxy);
+                    case "equals":
+                        return proxy == arguments[0];
+                    default:
+                        throw new VBoxException("The connection to VirtualBox was closed.");
+                }
+            });
 
     private final ApplicationSettings preferences = ApplicationSettings.shared();
     private final ConnectionProfiles profiles = new ConnectionProfiles(preferences);
@@ -122,9 +147,21 @@ public final class RemoteBoxApplication extends JFrame {
     private final JTree snapshotTree = new JTree(snapshotModel);
     private final JLabel snapshotStatus = new JLabel("Select a guest to view its snapshots.");
     private final JLabel connectionStatus = new JLabel("Disconnected");
-    private final JLabel machineCountLabel = new JLabel("No guests");
+    private final JLabel serverMemoryLabel = new JLabel();
     private final JProgressBar serverMemoryBar = new JProgressBar(0, 100);
     private final Timer refreshTimer;
+
+    /** Numeric entries are focus ring widths, the rest are focus border colours. */
+    private static final String[] FOCUS_BORDER_KEYS = {
+            "Component.focusWidth", "Component.innerFocusWidth", "Component.focusColor",
+            "Component.focusedBorderColor", "Button.focusedBorderColor",
+            "Button.default.focusedBorderColor", "TextField.focusedBorderColor",
+            "PasswordField.focusedBorderColor", "FormattedTextField.focusedBorderColor",
+            "ComboBox.focusedBorderColor", "Spinner.focusedBorderColor",
+            "ScrollPane.focusedBorderColor", "CheckBox.icon.focusedBorderColor",
+            "RadioButton.icon.focusedBorderColor", "ToggleButton.focusedBorderColor"
+    };
+    private static final Map<String, Object> FOCUS_BORDER_DEFAULTS = new LinkedHashMap<>();
 
     private JButton startButton;
     private JButton stopButton;
@@ -139,7 +176,8 @@ public final class RemoteBoxApplication extends JFrame {
     private JButton snapshotPropertiesButton;
     private JButton cloneSnapshotButton;
     private JMenu machineMenu;
-    private VirtualBoxClient client;
+    // Assigned on the event thread, read by every background worker.
+    private volatile VirtualBoxClient client = DISCONNECTED;
     private boolean busy;
     private long connectionGeneration;
     private long snapshotPreviewGeneration;
@@ -149,6 +187,8 @@ public final class RemoteBoxApplication extends JFrame {
     private long hostMemoryGeneration;
     private long machineRefreshGeneration;
     private boolean machineRefreshRunning;
+    private String serverMemoryText = "";
+    private String footerStatus;
     private List<VirtualMachine> shownMachines = List.of();
 
     public static void main(String[] args) {
@@ -208,7 +248,7 @@ public final class RemoteBoxApplication extends JFrame {
         addWindowFocusListener(new WindowAdapter() {
             @Override
             public void windowGainedFocus(WindowEvent event) {
-                if (client != null) {
+                if (isConnected()) {
                     refreshAll();
                     refreshTimer.start();
                 }
@@ -287,61 +327,99 @@ public final class RemoteBoxApplication extends JFrame {
         JMenuBar menuBar = new JMenuBar();
 
         JMenu file = new JMenu("File");
-        file.add(menuItem("Connect…", event -> showConnectionDialog()));
-        file.add(menuItem("Connection Profiles…", event -> showProfilesDialog()));
-        file.add(menuItem("Preferences…", event -> showPreferencesDialog()));
-        file.add(menuItem("Save Message Log…", event -> saveMessageLog()));
+        file.setToolTipText("Connections, preferences, appliances, and the host-wide managers");
+        file.add(menuItem("Connect…", "Opens the connection dialog for a VirtualBox host.",
+                event -> showConnectionDialog()));
+        file.add(menuItem("Connection Profiles…", "Manages the saved hosts and picks the one used at startup.",
+                event -> showProfilesDialog()));
+        file.add(menuItem("Preferences…", "Refresh interval, confirmation prompts, and the remote-display client.",
+                event -> showPreferencesDialog()));
+        file.add(menuItem("Save Message Log…", "Writes the messages of this session to a text file.",
+                event -> saveMessageLog()));
         file.addSeparator();
-        file.add(menuItem("Import Appliance…", event -> importAppliance()));
-        file.add(menuItem("Export Appliance…", event -> exportAppliance()));
-        file.add(menuItem("Virtual Media Manager…", event -> showMediaManager()));
-        file.add(menuItem("Host Network Manager…", event -> showHostNetworkManager()));
+        file.add(menuItem("Import Appliance…", "Imports guests from an OVF or OVA file that lies on the server.",
+                event -> importAppliance()));
+        file.add(menuItem("Export Appliance…", "Writes selected guests to an OVF or OVA file on the server.",
+                event -> exportAppliance()));
+        file.add(menuItem("Virtual Media Manager…", "Lists the disk, DVD, and floppy images registered on the server.",
+                event -> showMediaManager()));
+        file.add(menuItem("Host Network Manager…", "Shows the host-only and NAT networks of the server.",
+                event -> showHostNetworkManager()));
         file.addSeparator();
-        file.add(menuItem("Disconnect", event -> disconnect()));
-        file.add(menuItem("Exit", event -> dispose()));
+        file.add(menuItem("Disconnect", "Logs off the VirtualBox host without closing the window.",
+                event -> disconnect()));
+        file.add(menuItem("Exit", "Closes this window; running guests keep running on the server.",
+                event -> dispose()));
         menuBar.add(file);
 
         JMenu guest = new JMenu("Machine");
-        guest.add(menuItem("New guest…", event -> showNewGuestDialog()));
-        guest.add(menuItem("Settings…", event -> showMachineSettingsDialog()));
-        guest.add(menuItem("Clone guest…", event -> cloneSelectedMachine()));
-        guest.add(menuItem("Set group…", event -> setMachineGroup()));
-        guest.add(menuItem("Guest logs…", event -> showGuestLogs()));
-        guest.add(menuItem("Remove guest…", event -> removeSelectedMachine()));
+        guest.setToolTipText("Create, configure, and control the selected guest");
+        guest.add(menuItem("New guest…", "Creates a guest, optionally with a startup disk and installer image.",
+                event -> showNewGuestDialog()));
+        guest.add(menuItem("Settings…", "Opens the complete configuration of the selected guest.",
+                event -> showMachineSettingsDialog()));
+        guest.add(menuItem("Clone guest…", "Copies the guest, either fully or as a linked clone.",
+                event -> cloneSelectedMachine()));
+        guest.add(menuItem("Set group…", "Moves the guest into another group of the guest list.",
+                event -> setMachineGroup()));
+        guest.add(menuItem("Guest logs…", "Shows the VBox.log files VirtualBox wrote for this guest.",
+                event -> showGuestLogs()));
+        guest.add(menuItem("Remove guest…", "Unregisters the guest, optionally deleting its files.",
+                event -> removeSelectedMachine()));
         guest.addSeparator();
-        guest.add(menuItem("Start", event -> runMachineAction("Starting", VirtualBoxClient::start)));
-        guest.add(menuItem("Power off", event -> powerOffSelected()));
-        guest.add(menuItem("ACPI shutdown", event -> runMachineAction("Sending ACPI shutdown signal", VirtualBoxClient::acpiShutdown)));
-        guest.add(menuItem("Save state", event -> runMachineAction("Saving state for", VirtualBoxClient::saveState)));
-        guest.add(menuItem("Discard saved state", event -> runMachineAction("Discarding saved state for", VirtualBoxClient::discardSavedState)));
+        guest.add(menuItem("Start", "Boots the guest headless on the server.", event -> startSelected()));
+        guest.add(menuItem("Power off", "Cuts the virtual power immediately; unwritten guest data is lost.",
+                event -> powerOffSelected()));
+        guest.add(menuItem("ACPI shutdown", "Presses the virtual power button so the guest shuts itself down.",
+                event -> runMachineAction("Sending ACPI shutdown signal", VirtualBoxClient::acpiShutdown)));
+        guest.add(menuItem("Save state", "Writes memory and CPU state to disk; the next start resumes there.",
+                event -> runMachineAction("Saving state for", VirtualBoxClient::saveState)));
+        guest.add(menuItem("Discard saved state", "Throws the saved state away so the guest boots from scratch.",
+                event -> runMachineAction("Discarding saved state for", VirtualBoxClient::discardSavedState)));
         guest.addSeparator();
-        guest.add(menuItem("Pause/Resume", event -> pauseOrResume()));
-        guest.add(menuItem("Reset", event -> resetSelected()));
+        guest.add(menuItem("Pause/Resume", "Freezes the running guest in memory, or lets a paused guest continue.",
+                event -> pauseOrResume()));
+        guest.add(menuItem("Reset", "Reboots the guest immediately, like pressing the reset button.",
+                event -> resetSelected()));
         guest.addSeparator();
-        guest.add(menuItem("Open display", event -> openDisplay()));
+        guest.add(menuItem("Open display", "Connects the configured remote-display client to the guest.",
+                event -> openDisplay()));
         machineMenu = guest;
         menuBar.add(guest);
 
         JMenu action = new JMenu("Action");
-        action.add(menuItem("Refresh", event -> refreshAllReportingErrors()));
-        action.add(menuItem("Server information…", event -> showServerInformation()));
+        action.setToolTipText("Server information and snapshot operations");
+        action.add(menuItem("Refresh", "Reads the guest list and host memory again right now.",
+                event -> refreshAllReportingErrors()));
+        action.add(menuItem("Server information…", "Shows version and capabilities of the connected server.",
+                event -> showServerInformation()));
         action.addSeparator();
-        action.add(menuItem("Take snapshot…", event -> takeSnapshot()));
-        action.add(menuItem("Snapshot details…", event -> showSnapshotDetails()));
-        action.add(menuItem("Restore snapshot…", event -> manageSnapshot(false)));
-        action.add(menuItem("Delete snapshot…", event -> manageSnapshot(true)));
+        action.add(menuItem("Take snapshot…", "Stores the current state of the guest under a name.",
+                event -> takeSnapshot()));
+        action.add(menuItem("Snapshot details…", "Lists the snapshots of the selected guest as text.",
+                event -> showSnapshotDetails()));
+        action.add(menuItem("Restore snapshot…", "Returns the guest to a snapshot; later changes are lost.",
+                event -> manageSnapshot(false)));
+        action.add(menuItem("Delete snapshot…", "Merges a snapshot into its parent and removes it.",
+                event -> manageSnapshot(true)));
         menuBar.add(action);
 
         JMenu devices = new JMenu("Devices");
-        devices.add(menuItem("Guest Display", event -> openDisplay()));
+        devices.setToolTipText("Display, keyboard, and screenshots of the running guest");
+        devices.add(menuItem("Guest Display", "Connects the configured remote-display client to the guest.",
+                event -> openDisplay()));
         JMenu keyboard = new JMenu("Keyboard");
+        keyboard.setToolTipText("Sends key combinations the host would otherwise intercept");
         addKeyboardItems(keyboard);
         devices.add(keyboard);
-        devices.add(menuItem("Save Screenshot…", event -> saveScreenshot()));
+        devices.add(menuItem("Save Screenshot…", "Captures the guest screen and saves it as a PNG file.",
+                event -> saveScreenshot()));
         menuBar.add(devices);
 
         JMenu help = new JMenu("Help");
-        help.add(menuItem("About", event -> showAbout()));
+        help.setToolTipText("Information about this client");
+        help.add(menuItem("About", "Shows the version and the transports this client speaks.",
+                event -> showAbout()));
         menuBar.add(help);
         return menuBar;
     }
@@ -358,8 +436,7 @@ public final class RemoteBoxApplication extends JFrame {
         toolBar.add(settingsButton);
         toolBar.addSeparator(new Dimension(18, 38));
 
-        startButton = remoteBoxToolButton("Start", "vm_start_32px.png",
-                event -> runMachineAction("Starting", VirtualBoxClient::start));
+        startButton = remoteBoxToolButton("Start", "vm_start_32px.png", event -> startSelected());
         stopButton = dropdownToolButton("Stop", "stop_32px.png", event -> showStopMenu());
         stopButton.setToolTipText("Stop the guest — choose how in the menu");
         discardButton = remoteBoxToolButton("Discard", "vm_discard_32px.png",
@@ -400,14 +477,6 @@ public final class RemoteBoxApplication extends JFrame {
         mainSplit.setBorder(BorderFactory.createEmptyBorder());
 
         JPanel root = new JPanel(new BorderLayout());
-        serverMemoryBar.setStringPainted(true);
-        serverMemoryBar.setBackground(Color.BLACK);
-        // Square corners and no border let the track run edge to edge.
-        serverMemoryBar.putClientProperty("JProgressBar.square", true);
-        serverMemoryBar.setBorder(BorderFactory.createEmptyBorder());
-        serverMemoryBar.setPreferredSize(new Dimension(0, 22));
-        showHostMemory(null);
-        root.add(serverMemoryBar, BorderLayout.NORTH);
         root.add(mainSplit, BorderLayout.CENTER);
         return root;
     }
@@ -470,8 +539,22 @@ public final class RemoteBoxApplication extends JFrame {
                 BorderFactory.createMatteBorder(1, 0, 0, 0, MiraDarkTheme.BORDER_COLOR),
                 new EmptyBorder(5, 10, 5, 10)
         ));
-        panel.add(connectionStatus, BorderLayout.WEST);
-        panel.add(machineCountLabel, BorderLayout.EAST);
+
+        serverMemoryBar.setStringPainted(false);
+        // The empty part of the track blends into the footer so only the used share shows.
+        serverMemoryBar.setBackground(panel.getBackground());
+        serverMemoryBar.putClientProperty("JProgressBar.square", true);
+        serverMemoryBar.setBorder(BorderFactory.createEmptyBorder());
+        serverMemoryBar.setPreferredSize(new Dimension(200, 14));
+        showHostMemory(null);
+
+        JPanel left = new JPanel(new FlowLayout(FlowLayout.LEFT, 14, 0));
+        left.setOpaque(false);
+        left.add(connectionStatus);
+        left.add(serverMemoryBar);
+
+        panel.add(left, BorderLayout.WEST);
+        panel.add(serverMemoryLabel, BorderLayout.EAST);
         return panel;
     }
 
@@ -565,8 +648,8 @@ public final class RemoteBoxApplication extends JFrame {
         hostMemoryGeneration++;
         machineRefreshGeneration++;
         VirtualBoxClient previousClient = client;
-        client = null;
-        if (previousClient == null) {
+        client = DISCONNECTED;
+        if (previousClient == DISCONNECTED) {
             showHostMemory(null);
             updateActionState();
             return;
@@ -596,7 +679,7 @@ public final class RemoteBoxApplication extends JFrame {
         detailsArea.setText("");
         clearSnapshots("Select a guest to view its snapshots.");
         connectionStatus.setText("Disconnected");
-        machineCountLabel.setText("No guests");
+        showFooterStatus(null);
         showHostMemory(null);
         updateActionState();
     }
@@ -607,7 +690,7 @@ public final class RemoteBoxApplication extends JFrame {
      */
     private void refreshHostMemory() {
         VirtualBoxClient memoryClient = client;
-        if (memoryClient == null) {
+        if (memoryClient == DISCONNECTED) {
             showHostMemory(null);
             return;
         }
@@ -628,8 +711,10 @@ public final class RemoteBoxApplication extends JFrame {
                 } catch (Exception exception) {
                     LOG.warn("Reading the host memory failed.", exception);
                     serverMemoryBar.setValue(0);
-                    serverMemoryBar.setString("Server Memory — unavailable");
+                    serverMemoryText = "Server Memory — unavailable";
+                    serverMemoryLabel.setToolTipText(errorMessage(exception));
                     serverMemoryBar.setToolTipText(errorMessage(exception));
+                    showFooterStatus(footerStatus);
                 }
             }
         }.execute();
@@ -638,13 +723,23 @@ public final class RemoteBoxApplication extends JFrame {
     private void showHostMemory(HostMemory memory) {
         if (memory == null || memory.totalMb() <= 0) {
             serverMemoryBar.setValue(0);
-            serverMemoryBar.setString("Server Memory — not connected");
+            serverMemoryText = "Server Memory — not connected";
+            serverMemoryLabel.setToolTipText(null);
             serverMemoryBar.setToolTipText(null);
+            showFooterStatus(footerStatus);
             return;
         }
         serverMemoryBar.setValue(memory.usedPercent());
-        serverMemoryBar.setString(memory.describe());
+        serverMemoryText = memory.describe();
+        serverMemoryLabel.setToolTipText(memory.describeExactly());
         serverMemoryBar.setToolTipText(memory.describeExactly());
+        showFooterStatus(footerStatus);
+    }
+
+    /** A transient message takes over the server memory text until {@code status} is null again. */
+    private void showFooterStatus(String status) {
+        footerStatus = status;
+        setLabelText(serverMemoryLabel, status == null ? serverMemoryText : status);
     }
 
     private void refreshAll() {
@@ -673,7 +768,7 @@ public final class RemoteBoxApplication extends JFrame {
      */
     private void refreshMachines(boolean reportErrors) {
         VirtualBoxClient refreshingClient = client;
-        if (refreshingClient == null || machineRefreshRunning) {
+        if (refreshingClient == DISCONNECTED || machineRefreshRunning) {
             return;
         }
         String selectedId = selectedMachine() == null ? null : selectedMachine().id();
@@ -682,7 +777,7 @@ public final class RemoteBoxApplication extends JFrame {
         machineRefreshRunning = true;
 
         // Only announce the refresh when the server is slow enough to notice.
-        Timer indicator = new Timer(300, event -> machineCountLabel.setText("Refreshing…"));
+        Timer indicator = new Timer(300, event -> showFooterStatus("Refreshing…"));
         indicator.setRepeats(false);
         indicator.start();
 
@@ -693,7 +788,7 @@ public final class RemoteBoxApplication extends JFrame {
                     if (generation == machineRefreshGeneration && client == refreshingClient) {
                         indicator.stop();
                         LOG.info("Listed {} guests in {}.", partial.size(), seconds(System.nanoTime() - started));
-                        showMachines(partial, selectedId);
+                        showPartialMachines(partial, selectedId);
                     }
                 }));
             }
@@ -716,7 +811,7 @@ public final class RemoteBoxApplication extends JFrame {
                 } catch (Exception exception) {
                     Throwable cause = exception.getCause() == null ? exception : exception.getCause();
                     LOG.warn("Refreshing the guest list failed.", cause);
-                    machineCountLabel.setText("Refresh failed");
+                    showFooterStatus("Refresh failed");
                     appendLog("Refreshing the guest list failed: " + cause.getMessage());
                     if (reportErrors) {
                         showError("Refreshing the guest list failed.\n\n" + cause.getMessage());
@@ -726,17 +821,39 @@ public final class RemoteBoxApplication extends JFrame {
         }.execute();
     }
 
-    private void showMachines(List<VirtualMachine> machines, String selectedId) {        machineCountLabel.setText(machines.size() + (machines.size() == 1 ? " guest" : " guests"));
+    private void showMachines(List<VirtualMachine> machines, String selectedId) {
+        showFooterStatus(null);
         if (machines.equals(shownMachines)) {
-            // Rebuilding the tree collapses folders and flickers, so an unchanged
-            // periodic refresh must leave it alone.
             return;
         }
         shownMachines = List.copyOf(machines);
-        machineModel.setMachines(machines);
-        expandGuestFolders();
-        restoreSelection(selectedId);
+        if (machineModel.setMachines(machines)) {
+            // Only a rebuilt tree has lost them.
+            expandGuestFolders();
+            restoreSelection(selectedId);
+        }
         updateSelection();
+    }
+
+    /**
+     * A partial publish carries only the guests read so far. Letting it drop the
+     * rest would rebuild the tree twice per refresh, so it may only add and update.
+     */
+    private void showPartialMachines(List<VirtualMachine> machines, String selectedId) {
+        Map<String, VirtualMachine> merged = new LinkedHashMap<>();
+        for (VirtualMachine machine : shownMachines) {
+            merged.put(machine.id(), machine);
+        }
+        for (VirtualMachine machine : machines) {
+            merged.put(machine.id(), machine);
+        }
+        showMachines(List.copyOf(merged.values()), selectedId);
+    }
+
+    private static void setLabelText(JLabel label, String text) {
+        if (!text.equals(label.getText())) {
+            label.setText(text);
+        }
     }
 
     private void refreshMachines() {
@@ -1165,11 +1282,14 @@ public final class RemoteBoxApplication extends JFrame {
         JTextField refreshSeconds = new JTextField(Integer.toString(preferences.getInt("refresh.seconds", 5)), 8);
         JCheckBox confirmActions = new JCheckBox("Confirm destructive guest actions",
                 preferences.getBoolean("confirm.actions", true));
+        JCheckBox hideFocusBorders = new JCheckBox("Hide focus borders on elements",
+                preferences.getBoolean("ui.hideFocusBorders", false));
+        boolean focusBordersWereHidden = hideFocusBorders.isSelected();
         String autoConnectName = profiles.autoConnectName();
 
         JPanel general = formPanel(
-                new String[]{"Refresh interval (seconds)", "", "Startup profile", "Settings file"},
-                new Component[]{refreshSeconds, confirmActions,
+                new String[]{"Refresh interval (seconds)", "", "", "Startup profile", "Settings file"},
+                new Component[]{refreshSeconds, confirmActions, hideFocusBorders,
                         formHelpText(autoConnectName.isBlank()
                                 ? "None — choose one in File ▸ Connection Profiles."
                                 : autoConnectName),
@@ -1224,12 +1344,16 @@ public final class RemoteBoxApplication extends JFrame {
             }
             preferences.putInt("refresh.seconds", seconds);
             preferences.putBoolean("confirm.actions", confirmActions.isSelected());
+            preferences.putBoolean("ui.hideFocusBorders", hideFocusBorders.isSelected());
             preferences.putBoolean("display.useMstsc", useMstsc.isSelected());
             preferences.putBoolean("display.autoScale", autoScale.isSelected());
             preferences.putBoolean("display.shareClipboard", shareClipboard.isSelected());
             preferences.put("display.rdpClient", rdpClient.getText().trim());
             preferences.put("display.vncClient", vncClient.getText().trim());
             refreshTimer.setDelay(seconds * 1_000);
+            if (hideFocusBorders.isSelected() != focusBordersWereHidden) {
+                reinstallLookAndFeel();
+            }
             appendLog("Preferences saved to " + preferences.location() + ".");
         } catch (NumberFormatException exception) {
             showError("Enter a refresh interval of at least five seconds.");
@@ -2380,7 +2504,7 @@ public final class RemoteBoxApplication extends JFrame {
 
         private void reload() {
             VirtualBoxClient loadingClient = client;
-            if (loadingClient == null) {
+            if (loadingClient == DISCONNECTED) {
                 return;
             }
             runBackground("Reloading storage layout", () -> loadingClient.storageLayout(machine), layout -> {
@@ -3344,6 +3468,29 @@ public final class RemoteBoxApplication extends JFrame {
         runMachineAction("Powering off", VirtualBoxClient::powerOff);
     }
 
+    private void powerOffToSnapshotSelected() {
+        VirtualMachine machine = selectedMachine();
+        Snapshot snapshot = currentSnapshot(machine);
+        if (machine == null || snapshot == null || !requireConnection()) {
+            return;
+        }
+        if (!confirmDestructiveAction("Power off '" + machine.name() + "' and return to snapshot '"
+                        + snapshot.name() + "'? Changes made since the snapshot was taken are lost.",
+                "Confirm Power Off and Restore")) {
+            return;
+        }
+        runBackground("Powering off and restoring snapshot", () -> {
+            client.closeDisplay(machine);
+            client.powerOff(machine);
+            restoreSnapshot(machine, snapshot.reference(), true);
+            return snapshot.name();
+        }, restored -> {
+            appendLog("Powered off " + machine.name() + " and restored snapshot '" + restored + "'.");
+            invalidateSnapshotPreview();
+            refreshMachines();
+        });
+    }
+
     private void resetSelected() {
         VirtualMachine machine = selectedMachine();
         if (machine == null) {
@@ -3555,9 +3702,80 @@ public final class RemoteBoxApplication extends JFrame {
                 "About " + APP_NAME, JOptionPane.INFORMATION_MESSAGE);
     }
 
+    /**
+     * Reads the current host memory before starting so the user can abort when the
+     * server cannot hold the guest's configured RAM.
+     */
+    private void startSelected() {
+        VirtualMachine machine = selectedMachine();
+        if (machine == null || !requireConnection()) {
+            return;
+        }
+        if (!isActionAllowed("Starting", machine)) {
+            showError("Starting is not available while '" + machine.name() + "' is "
+                    + machine.displayState() + ".");
+            return;
+        }
+        VirtualBoxClient memoryClient = client;
+        new SwingWorker<HostMemory, Void>() {
+            @Override
+            protected HostMemory doInBackground() throws Exception {
+                return memoryClient.hostMemory();
+            }
+
+            @Override
+            protected void done() {
+                HostMemory memory = null;
+                try {
+                    memory = get();
+                } catch (Exception exception) {
+                    // An unreadable host memory must not stand in the way of starting.
+                    LOG.warn("Reading the host memory before starting {} failed.", machine.name(), exception);
+                }
+                if (client == memoryClient && confirmMemoryShortage(machine, memory)) {
+                    runMachineAction("Starting", machine, VirtualBoxClient::start);
+                }
+            }
+        }.execute();
+    }
+
+    /**
+     * @return {@code true} when the guest may be started, either because enough
+     *         memory is free or because the user chose to continue anyway
+     */
+    private boolean confirmMemoryShortage(VirtualMachine machine, HostMemory memory) {
+        if (memory == null || memory.totalMb() <= 0 || machine.memoryMb() <= 0
+                || memory.availableMb() >= machine.memoryMb()) {
+            return true;
+        }
+        String shortage = "the server has %d MB free but '%s' is configured for %d MB"
+                .formatted(memory.availableMb(), machine.name(), machine.memoryMb());
+        Object[] options = {"Start Anyway", "Abort"};
+        int choice = JOptionPane.showOptionDialog(this,
+                "<html>Not enough free memory on the server.<br><br>"
+                        + memory.describeExactly() + "<br>"
+                        + "'" + machine.name() + "' is configured for " + machine.memoryMb() + " MB.<br><br>"
+                        + "Starting it may fail or push the server into swapping.</html>",
+                "Not Enough Free Memory", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE,
+                null, options, options[1]);
+        if (choice != JOptionPane.YES_OPTION) {
+            appendLog("Aborted starting " + machine.name() + " because " + shortage + ".");
+            return false;
+        }
+        appendLog("Starting " + machine.name() + " although " + shortage + ".");
+        return true;
+    }
+
     private void runMachineAction(String action, MachineAction operation) {
         VirtualMachine machine = selectedMachine();
         if (machine == null || !requireConnection()) {
+            return;
+        }
+        runMachineAction(action, machine, operation);
+    }
+
+    private void runMachineAction(String action, VirtualMachine machine, MachineAction operation) {
+        if (!requireConnection()) {
             return;
         }
         if (!isActionAllowed(action, machine)) {
@@ -3621,8 +3839,12 @@ public final class RemoteBoxApplication extends JFrame {
 
     private void updateSelection() {
         VirtualMachine machine = selectedMachine();
-        detailsArea.setText(machine == null ? "" : machineDetails(machine));
-        detailsArea.setCaretPosition(0);
+        String details = machine == null ? "" : machineDetails(machine);
+        // Rewriting unchanged text would scroll the pane back to the top.
+        if (!details.equals(detailsArea.getText())) {
+            detailsArea.setText(details);
+            detailsArea.setCaretPosition(0);
+        }
         updateSnapshotPreview(machine);
         updateActionState();
     }
@@ -3648,7 +3870,7 @@ public final class RemoteBoxApplication extends JFrame {
             return;
         }
         VirtualBoxClient snapshotClient = client;
-        if (snapshotClient == null) {
+        if (snapshotClient == DISCONNECTED) {
             snapshotPreviewMachineId = null;
             clearSnapshots("Connect to a VirtualBox host to view snapshots.");
             return;
@@ -3754,6 +3976,27 @@ public final class RemoteBoxApplication extends JFrame {
         return node.getUserObject() instanceof Snapshot snapshot ? snapshot : null;
     }
 
+    /** The snapshot the guest runs off, which is the one "return to last Snapshot" restores. */
+    private Snapshot currentSnapshot(VirtualMachine machine) {
+        if (machine == null || !machine.id().equals(shownSnapshotMachineId)) {
+            return null;
+        }
+        return currentSnapshot(shownSnapshots.roots());
+    }
+
+    private static Snapshot currentSnapshot(List<Snapshot> snapshots) {
+        for (Snapshot snapshot : snapshots) {
+            if (snapshot.current()) {
+                return snapshot;
+            }
+            Snapshot descendant = currentSnapshot(snapshot.children());
+            if (descendant != null) {
+                return descendant;
+            }
+        }
+        return null;
+    }
+
     /** [Current State] restores the snapshot it was derived from. */
     private Snapshot restorableSnapshot() {
         Snapshot snapshot = selectedSnapshot();
@@ -3773,7 +4016,7 @@ public final class RemoteBoxApplication extends JFrame {
         if (takeSnapshotButton == null) {
             return;
         }
-        boolean guestSelected = client != null && !busy && selectedMachine() != null;
+        boolean guestSelected = isConnected() && !busy && selectedMachine() != null;
         boolean snapshotSelected = guestSelected && selectedSnapshot() != null;
         takeSnapshotButton.setEnabled(guestSelected && !snapshotSelected);
         deleteSnapshotButton.setEnabled(snapshotSelected);
@@ -3801,12 +4044,18 @@ public final class RemoteBoxApplication extends JFrame {
             return;
         }
         runBackground("Restoring snapshot", () -> {
+            boolean reopenDisplay = restart && client.isDisplayOpen(machine);
             if (restart) {
+                // The power cycle drops the display connection, so close the client first.
+                client.closeDisplay(machine);
                 client.powerOff(machine);
             }
             restoreSnapshot(machine, snapshot.reference(), restart);
             if (restart) {
                 client.start(machine);
+                if (reopenDisplay) {
+                    client.showDisplay(machine);
+                }
             }
             return snapshot.name();
         }, restored -> {
@@ -3919,7 +4168,7 @@ public final class RemoteBoxApplication extends JFrame {
 
     private void updateActionState() {
         VirtualMachine machine = selectedMachine();
-        boolean connected = client != null && !busy;
+        boolean connected = isConnected() && !busy;
         boolean selected = connected && machine != null;
         if (startButton != null) {
             startButton.setEnabled(selected && machine.canStart());
@@ -3961,8 +4210,12 @@ public final class RemoteBoxApplication extends JFrame {
         }
     }
 
+    private boolean isConnected() {
+        return client != DISCONNECTED;
+    }
+
     private boolean requireConnection() {
-        if (client != null) {
+        if (isConnected()) {
             return true;
         }
         showError("Connect to a VirtualBox host first.");
@@ -4021,11 +4274,18 @@ public final class RemoteBoxApplication extends JFrame {
      */
     private void showStopMenu() {
         VirtualMachine machine = selectedMachine();
-        boolean stoppable = client != null && !busy && machine != null && machine.canStop();
+        boolean stoppable = isConnected() && !busy && machine != null && machine.canStop();
         JPopupMenu menu = new JPopupMenu();
-        menu.add(stopOption("Instant Power Off", "Cuts the virtual power immediately, like pulling the plug. "
+        menu.add(stopOption("Power Off", "Cuts the virtual power immediately, like pulling the plug. "
                         + "Data the guest has not written to disk is lost.", stoppable,
                 event -> powerOffSelected()));
+        Snapshot snapshot = currentSnapshot(machine);
+        if (snapshot != null) {
+            menu.add(stopOption("Power Off and return to last Snapshot",
+                    "Cuts the virtual power and then restores the snapshot '" + snapshot.name()
+                            + "'. Changes made since that snapshot are lost.", stoppable,
+                    event -> powerOffToSnapshotSelected()));
+        }
         menu.add(stopOption("ACPI Shutdown", "Presses the virtual power button. The guest operating system "
                         + "shuts itself down cleanly, or ignores the signal if it has no ACPI support.", stoppable,
                 event -> runMachineAction("Sending ACPI shutdown signal", VirtualBoxClient::acpiShutdown)));
@@ -4054,7 +4314,7 @@ public final class RemoteBoxApplication extends JFrame {
      * so they can only reach the guest through the keyboard interface.
      */
     private void addKeyboardItems(java.awt.Container menu) {
-        menu.add(keyboardItem("Ctrl-Alt-Del", "The secure attention sequence: sign-in screen on Windows, "
+        menu.add(menuItem("Ctrl-Alt-Del", "The secure attention sequence: sign-in screen on Windows, "
                 + "reboot on many other systems.", event -> sendCtrlAltDelete()));
 
         JMenu consoles = new JMenu("Ctrl-Alt-F…");
@@ -4062,7 +4322,7 @@ public final class RemoteBoxApplication extends JFrame {
         for (int number = 1; number <= FUNCTION_KEY_CODES.length; number++) {
             int code = FUNCTION_KEY_CODES[number - 1];
             String label = "Ctrl-Alt-F" + number;
-            consoles.add(keyboardItem(label, "Switches the guest to virtual console " + number + ".",
+            consoles.add(menuItem(label, "Switches the guest to virtual console " + number + ".",
                     event -> sendKeys(label, 29, 56, code, 157, 184, code + 128)));
         }
         menu.add(consoles);
@@ -4072,28 +4332,22 @@ public final class RemoteBoxApplication extends JFrame {
         for (int number = 1; number <= 8; number++) {
             int code = FUNCTION_KEY_CODES[number - 1];
             String label = "Alt-SysRq+F" + number;
-            sysrq.add(keyboardItem(label, "Runs the magic SysRq command bound to F" + number
+            sysrq.add(menuItem(label, "Runs the magic SysRq command bound to F" + number
                             + " in the guest kernel.",
                     event -> sendKeys(label, 56, 84, 184, 212, code, code + 128)));
         }
-        sysrq.add(keyboardItem("Alt-SysRq+H", "Prints the list of available magic SysRq commands to the "
+        sysrq.add(menuItem("Alt-SysRq+H", "Prints the list of available magic SysRq commands to the "
                 + "guest console.", event -> sendKeys("Alt-SysRq+H", 56, 84, 184, 212, 35, 163)));
         menu.add(sysrq);
 
-        menu.add(keyboardItem("Ctrl-Alt-Backspace", "Kills the X server of a Linux guest, if the guest still "
+        menu.add(menuItem("Ctrl-Alt-Backspace", "Kills the X server of a Linux guest, if the guest still "
                 + "enables that shortcut.", event -> sendKeys("Ctrl-Alt-Backspace", 29, 56, 14, 157, 184, 142)));
-        menu.add(keyboardItem("Ctrl-C", "Interrupts the program running in the guest's foreground.",
+        menu.add(menuItem("Ctrl-C", "Interrupts the program running in the guest's foreground.",
                 event -> sendKeys("Ctrl-C", 29, 46, 157, 174)));
-        menu.add(keyboardItem("Ctrl-D", "Signals end of input to the program running in the guest's foreground.",
+        menu.add(menuItem("Ctrl-D", "Signals end of input to the program running in the guest's foreground.",
                 event -> sendKeys("Ctrl-D", 29, 32, 157, 160)));
-        menu.add(keyboardItem("Release Keys", "Releases every key the guest still believes is held down, "
+        menu.add(menuItem("Release Keys", "Releases every key the guest still believes is held down, "
                 + "which repairs a stuck modifier key.", event -> releaseKeys()));
-    }
-
-    private static JMenuItem keyboardItem(String text, String tooltip, java.awt.event.ActionListener listener) {
-        JMenuItem item = menuItem(text, listener);
-        item.setToolTipText(tooltip);
-        return item;
     }
 
     private void sendKeys(String label, int... scancodes) {
@@ -4428,6 +4682,12 @@ public final class RemoteBoxApplication extends JFrame {
         return item;
     }
 
+    private static JMenuItem menuItem(String text, String tooltip, java.awt.event.ActionListener listener) {
+        JMenuItem item = menuItem(text, listener);
+        item.setToolTipText(tooltip);
+        return item;
+    }
+
     private static JLabel formHelpText(String text) {
         JLabel help = new JLabel(text);
         help.setForeground(MiraDarkTheme.DISABLED_FOREGROUND);
@@ -4571,11 +4831,43 @@ public final class RemoteBoxApplication extends JFrame {
                 throw new IllegalStateException("MiraDark.properties is missing from the application resources.");
             }
             UIManager.setLookAndFeel(new FlatPropertiesLaf("Mira Dark", theme));
+            applyFocusBorderPreference(ApplicationSettings.shared().getBoolean("ui.hideFocusBorders", false));
             LOG.info("Look and feel installed in {}.", seconds(System.nanoTime() - started));
         } catch (Exception exception) {
             LOG.error("Could not install the Mira Dark look and feel.", exception);
             throw new IllegalStateException("Could not install the autoMATE Mira Dark look and feel.", exception);
         }
+    }
+
+    /**
+     * Focus rings are FlatLaf UI defaults, so hiding them means replacing the accent
+     * colours with the plain border colour and dropping the focus ring width.
+     */
+    private static void applyFocusBorderPreference(boolean hide) {
+        if (FOCUS_BORDER_DEFAULTS.isEmpty()) {
+            for (String key : FOCUS_BORDER_KEYS) {
+                FOCUS_BORDER_DEFAULTS.put(key, UIManager.get(key));
+            }
+        }
+        Color plain = UIManager.getColor("Component.borderColor");
+        for (String key : FOCUS_BORDER_KEYS) {
+            Object original = FOCUS_BORDER_DEFAULTS.get(key);
+            UIManager.put(key, hide ? (original instanceof Number ? 0 : plain) : original);
+        }
+    }
+
+    /**
+     * FlatLaf caches borders per look and feel, so a changed focus setting only shows
+     * once the whole look and feel has been rebuilt.
+     */
+    private void reinstallLookAndFeel() {
+        if (!(UIManager.getLookAndFeel() instanceof FlatPropertiesLaf)) {
+            // An embedding host owns the look and feel.
+            return;
+        }
+        FOCUS_BORDER_DEFAULTS.clear();
+        installLookAndFeel();
+        FlatLaf.updateUI();
     }
 
     /**
@@ -4626,6 +4918,9 @@ public final class RemoteBoxApplication extends JFrame {
     private static final class GuestTreeModel extends DefaultTreeModel {
         private final DefaultMutableTreeNode root;
         private final Map<String, TreePath> machinePaths = new LinkedHashMap<>();
+        private final Map<String, DefaultMutableTreeNode> guestNodes = new LinkedHashMap<>();
+        /** Group path and identifier of every guest, in tree order. */
+        private List<String> layout = List.of();
 
         private GuestTreeModel() {
             this(new DefaultMutableTreeNode("Guests"));
@@ -4636,40 +4931,70 @@ public final class RemoteBoxApplication extends JFrame {
             this.root = root;
         }
 
-        void setMachines(List<VirtualMachine> machines) {
+        /**
+         * @return whether the tree had to be rebuilt, which resets its expansion
+         *         state and selection. A refresh that only brings new guest states
+         *         leaves the layout alone and repaints the affected rows instead,
+         *         which is what keeps the periodic refresh from flickering.
+         */
+        boolean setMachines(List<VirtualMachine> machines) {
+            List<VirtualMachine> ordered = machines.stream()
+                    .sorted(Comparator.comparing(GuestTreeModel::groupPath)
+                            .thenComparing(VirtualMachine::name, String.CASE_INSENSITIVE_ORDER))
+                    .toList();
+            List<String> requested = ordered.stream()
+                    .map(machine -> groupPath(machine) + '\n' + machine.id())
+                    .toList();
+            if (requested.equals(layout)) {
+                for (VirtualMachine machine : ordered) {
+                    DefaultMutableTreeNode node = guestNodes.get(machine.id());
+                    if (node != null && !machine.equals(node.getUserObject())) {
+                        node.setUserObject(machine);
+                        nodeChanged(node);
+                    }
+                }
+                return false;
+            }
+
             root.removeAllChildren();
             machinePaths.clear();
+            guestNodes.clear();
             Map<String, DefaultMutableTreeNode> groups = new LinkedHashMap<>();
             groups.put("/", root);
 
-            machines.stream()
-                    .sorted(Comparator.comparing(VirtualMachine::groups)
-                            .thenComparing(VirtualMachine::name, String.CASE_INSENSITIVE_ORDER))
-                    .forEach(machine -> {
-                        DefaultMutableTreeNode parent = root;
-                        String groupPath = machine.groups() == null ? "/" : machine.groups().trim();
-                        if (!groupPath.isBlank() && !"/".equals(groupPath)) {
-                            StringBuilder path = new StringBuilder();
-                            for (String segment : groupPath.split("/")) {
-                                if (segment.isBlank()) {
-                                    continue;
-                                }
-                                path.append('/').append(segment);
-                                String key = path.toString();
-                                DefaultMutableTreeNode folder = groups.get(key);
-                                if (folder == null) {
-                                    folder = new DefaultMutableTreeNode(segment);
-                                    groups.put(key, folder);
-                                    parent.add(folder);
-                                }
-                                parent = folder;
-                            }
+            for (VirtualMachine machine : ordered) {
+                DefaultMutableTreeNode parent = root;
+                String groupPath = groupPath(machine);
+                if (!"/".equals(groupPath)) {
+                    StringBuilder walked = new StringBuilder();
+                    for (String segment : groupPath.split("/")) {
+                        if (segment.isBlank()) {
+                            continue;
                         }
-                        DefaultMutableTreeNode guest = new DefaultMutableTreeNode(machine, false);
-                        parent.add(guest);
-                        machinePaths.put(machine.id(), new TreePath(guest.getPath()));
-                    });
+                        walked.append('/').append(segment);
+                        String key = walked.toString();
+                        DefaultMutableTreeNode folder = groups.get(key);
+                        if (folder == null) {
+                            folder = new DefaultMutableTreeNode(segment);
+                            groups.put(key, folder);
+                            parent.add(folder);
+                        }
+                        parent = folder;
+                    }
+                }
+                DefaultMutableTreeNode guest = new DefaultMutableTreeNode(machine, false);
+                parent.add(guest);
+                machinePaths.put(machine.id(), new TreePath(guest.getPath()));
+                guestNodes.put(machine.id(), guest);
+            }
+            layout = requested;
             reload();
+            return true;
+        }
+
+        private static String groupPath(VirtualMachine machine) {
+            String groups = machine.groups() == null ? "/" : machine.groups().trim();
+            return groups.isBlank() ? "/" : groups;
         }
 
         TreePath pathForMachine(String id) {

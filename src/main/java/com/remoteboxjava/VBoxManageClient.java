@@ -172,15 +172,27 @@ public final class VBoxManageClient implements VirtualBoxClient {
 
     private Snapshot readSnapshot(Map<String, Map<String, String>> nodes, String path, String currentUuid) {
         Map<String, String> values = nodes.getOrDefault(path, Map.of());
-        List<Snapshot> children = new ArrayList<>();
-        for (int child = 1; nodes.containsKey(path + "-" + child); child++) {
-            children.add(readSnapshot(nodes, path + "-" + child, currentUuid));
-        }
+        // A direct child carries exactly one more level, and VBoxManage may leave
+        // gaps in the numbering, so the children are taken from the keys that exist.
+        String prefix = path + "-";
+        List<Snapshot> children = nodes.keySet().stream()
+                .filter(key -> key.startsWith(prefix) && key.indexOf('-', prefix.length()) < 0)
+                .sorted(Comparator.comparingInt(key -> childIndex(key, prefix.length())))
+                .map(key -> readSnapshot(nodes, key, currentUuid))
+                .toList();
         String uuid = values.getOrDefault("uuid", "");
         // VBoxManage reports neither the creation time nor whether the state was live.
         return new Snapshot(uuid, values.getOrDefault("name", "Snapshot"),
                 values.getOrDefault("description", ""), 0L, false,
                 !uuid.isEmpty() && uuid.equals(currentUuid), children);
+    }
+
+    private static int childIndex(String key, int start) {
+        try {
+            return Integer.parseInt(key.substring(start));
+        } catch (NumberFormatException ignored) {
+            return Integer.MAX_VALUE;
+        }
     }
 
     @Override

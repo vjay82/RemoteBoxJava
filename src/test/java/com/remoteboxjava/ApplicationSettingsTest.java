@@ -69,6 +69,15 @@ class ApplicationSettingsTest {
     }
 
     @Test
+    void compactArraysOfLiteralsAreAccepted() {
+        Map<String, String> values = ApplicationSettings.fromJson("{\"ports\":[18083,18084],\"on\":[true]}");
+
+        assertEquals("18083", values.get("ports.0"));
+        assertEquals("18084", values.get("ports.1"));
+        assertEquals("true", values.get("on.0"));
+    }
+
+    @Test
     void malformedSettingsFileIsNotOverwritten(@TempDir Path directory) throws Exception {
         Path file = directory.resolve("settings.json");
         String malformed = "{\n  \"webservice.endpoint\": \"http://recover-me\",\n";

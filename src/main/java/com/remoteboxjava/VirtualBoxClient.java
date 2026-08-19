@@ -9,6 +9,25 @@ import java.util.function.Consumer;
  * Common abstraction for local VBoxManage and RemoteBox-compatible web-service connections.
  */
 public interface VirtualBoxClient extends AutoCloseable {
+    /** Reports how far the long-running operation the caller started has come. */
+    @FunctionalInterface
+    interface ProgressListener {
+        /**
+         * @param operation what VirtualBox is doing right now, or {@code null} when
+         *                  nothing is running
+         * @param percent   completion of {@code operation}, or a negative value when
+         *                  the transport cannot report one
+         */
+        void onProgress(String operation, int percent);
+    }
+
+    /**
+     * Installs the listener that long-running operations report to. Transports
+     * without progress information leave it unused.
+     */
+    default void setProgressListener(ProgressListener listener) {
+    }
+
     String version() throws VBoxException;
 
     List<VirtualMachine> listMachines() throws VBoxException;
@@ -400,6 +419,16 @@ public interface VirtualBoxClient extends AutoCloseable {
      * @return the command that was launched, for the message log
      */
     String showDisplay(VirtualMachine machine) throws VBoxException;
+
+    /** @return whether a display client this connection launched for the guest is still running */
+    default boolean isDisplayOpen(VirtualMachine machine) {
+        return false;
+    }
+
+    /** Terminates the display client this connection launched for the guest, if any. */
+    default void closeDisplay(VirtualMachine machine) {
+        // Only connections that launch a client process have something to close.
+    }
 
     private static VBoxException unsupported(String action) {
         return new VBoxException("The current connection does not support " + action + ".");
