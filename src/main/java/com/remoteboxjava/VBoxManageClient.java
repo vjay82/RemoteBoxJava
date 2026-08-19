@@ -127,6 +127,82 @@ public final class VBoxManageClient implements VirtualBoxClient {
         execute("snapshot", machine.id(), "delete", snapshot);
     }
 
+    @Override
+    public Snapshot.Tree snapshotTree(VirtualMachine machine) throws VBoxException {
+        String output;
+        try {
+            output = execute("snapshot", machine.id(), "list", "--machinereadable");
+        } catch (VBoxException exception) {
+            if (exception.getMessage() != null && exception.getMessage().contains("does not have any snapshots")) {
+                return Snapshot.Tree.EMPTY;
+            }
+            throw exception;
+        }
+
+        // VBoxManage encodes the tree in the key suffix: "SnapshotName" is the root,
+        // "SnapshotName-1" its first child, "SnapshotName-1-2" that child's second.
+        Map<String, Map<String, String>> nodes = new LinkedHashMap<>();
+        String currentUuid = "";
+        for (String line : output.lines().toList()) {
+            int equals = line.indexOf('=');
+            if (equals < 0) {
+                continue;
+            }
+            String key = line.substring(0, equals).trim();
+            String value = unquote(line.substring(equals + 1));
+            if (key.equals("CurrentSnapshotUUID")) {
+                currentUuid = value;
+            } else if (key.startsWith("SnapshotName")) {
+                nodes.computeIfAbsent(key.substring("SnapshotName".length()), path -> new LinkedHashMap<>())
+                        .put("name", value);
+            } else if (key.startsWith("SnapshotUUID")) {
+                nodes.computeIfAbsent(key.substring("SnapshotUUID".length()), path -> new LinkedHashMap<>())
+                        .put("uuid", value);
+            } else if (key.startsWith("SnapshotDescription")) {
+                nodes.computeIfAbsent(key.substring("SnapshotDescription".length()), path -> new LinkedHashMap<>())
+                        .put("description", value);
+            }
+        }
+
+        if (!nodes.containsKey("")) {
+            return Snapshot.Tree.EMPTY;
+        }
+        return new Snapshot.Tree(List.of(readSnapshot(nodes, "", currentUuid)), false);
+    }
+
+    private Snapshot readSnapshot(Map<String, Map<String, String>> nodes, String path, String currentUuid) {
+        Map<String, String> values = nodes.getOrDefault(path, Map.of());
+        List<Snapshot> children = new ArrayList<>();
+        for (int child = 1; nodes.containsKey(path + "-" + child); child++) {
+            children.add(readSnapshot(nodes, path + "-" + child, currentUuid));
+        }
+        String uuid = values.getOrDefault("uuid", "");
+        // VBoxManage reports neither the creation time nor whether the state was live.
+        return new Snapshot(uuid, values.getOrDefault("name", "Snapshot"),
+                values.getOrDefault("description", ""), 0L, false,
+                !uuid.isEmpty() && uuid.equals(currentUuid), children);
+    }
+
+    @Override
+    public void updateSnapshot(VirtualMachine machine, String snapshotId, String name, String description)
+            throws VBoxException {
+        execute("snapshot", machine.id(), "edit", snapshotId,
+                "--name", name, "--description", description == null ? "" : description);
+    }
+
+    @Override
+    public void cloneFromSnapshot(VirtualMachine machine, String snapshotId, String name, boolean linked)
+            throws VBoxException {
+        List<String> arguments = new ArrayList<>(List.of(
+                "clonevm", machine.id(), "--snapshot", snapshotId, "--name", name, "--register"
+        ));
+        if (linked) {
+            arguments.add("--options");
+            arguments.add("link");
+        }
+        execute(arguments);
+    }
+
     public void createMachine(String name, String osType, int memoryMb, int cpuCount) throws VBoxException {
         createMachine(NewMachineSpec.basic(name, osType, memoryMb, cpuCount));
     }
@@ -1098,6 +1174,15 @@ public final class VBoxManageClient implements VirtualBoxClient {
     public void sendCtrlAltDelete(VirtualMachine machine) throws VBoxException {
         execute("controlvm", machine.id(), "keyboardputscancode",
                 "1d", "38", "53", "d3", "b8", "9d");
+    }
+
+    @Override
+    public void sendScancodes(VirtualMachine machine, int... scancodes) throws VBoxException {
+        List<String> arguments = new ArrayList<>(List.of("controlvm", machine.id(), "keyboardputscancode"));
+        for (int scancode : scancodes) {
+            arguments.add(Integer.toHexString(scancode & 0xFF));
+        }
+        execute(arguments);
     }
 
     @Override

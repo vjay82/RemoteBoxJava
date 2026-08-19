@@ -48,6 +48,26 @@ public interface VirtualBoxClient extends AutoCloseable {
 
     void deleteSnapshot(VirtualMachine machine, String snapshot) throws VBoxException;
 
+    /**
+     * The snapshot forest of a guest. Transports that can only report snapshot
+     * names fall back to a flat list without timestamps.
+     */
+    default Snapshot.Tree snapshotTree(VirtualMachine machine) throws VBoxException {
+        return new Snapshot.Tree(snapshots(machine).stream()
+                .map(name -> new Snapshot(name, name, "", 0L, false, false, List.of()))
+                .toList(), false);
+    }
+
+    default void updateSnapshot(VirtualMachine machine, String snapshotId, String name, String description)
+            throws VBoxException {
+        throw unsupported("edit snapshot properties");
+    }
+
+    default void cloneFromSnapshot(VirtualMachine machine, String snapshotId, String name, boolean linked)
+            throws VBoxException {
+        throw unsupported("clone a guest from a snapshot");
+    }
+
     void createMachine(String name, String osType, int memoryMb, int cpuCount) throws VBoxException;
 
     /**
@@ -358,6 +378,16 @@ public interface VirtualBoxClient extends AutoCloseable {
      * Sends the Ctrl-Alt-Delete keyboard sequence to a running guest.
      */
     void sendCtrlAltDelete(VirtualMachine machine) throws VBoxException;
+
+    /** Sends raw PS/2 scancodes, which must contain the press and the release code of every key. */
+    default void sendScancodes(VirtualMachine machine, int... scancodes) throws VBoxException {
+        throw unsupported("send keyboard sequences");
+    }
+
+    /** Releases every key the guest still believes is held down. */
+    default void releaseKeys(VirtualMachine machine) throws VBoxException {
+        throw unsupported("release the guest keys");
+    }
 
     /**
      * Captures the guest's primary display as a PNG image.

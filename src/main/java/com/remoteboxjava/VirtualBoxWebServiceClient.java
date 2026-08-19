@@ -562,6 +562,83 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     }
 
     @Override
+    public synchronized Snapshot.Tree snapshotTree(VirtualMachine machine) throws VBoxException {
+        String machineReference = findMachine(machine);
+        String currentSnapshot = property(machineReference, "IMachine_getCurrentSnapshot");
+        if (currentSnapshot.isBlank()) {
+            return Snapshot.Tree.EMPTY;
+        }
+
+        // getCurrentSnapshot identifies the active leaf, so walk up to the root
+        // before reading the tree: the panel shows the complete history.
+        String rootSnapshot = currentSnapshot;
+        String parent;
+        while (!(parent = property(rootSnapshot, "ISnapshot_getParent")).isBlank()) {
+            rootSnapshot = parent;
+        }
+
+        String currentId = property(currentSnapshot, "ISnapshot_getId");
+        boolean modified = "true".equalsIgnoreCase(property(machineReference, "IMachine_getCurrentStateModified"));
+        return new Snapshot.Tree(List.of(readSnapshot(rootSnapshot, currentId)), modified);
+    }
+
+    @Override
+    public synchronized void updateSnapshot(VirtualMachine machine, String snapshotId, String name, String description)
+            throws VBoxException {
+        String snapshotReference = findSnapshot(machine, snapshotId);
+        callMany("ISnapshot_setName", element("_this", snapshotReference) + element("name", name));
+        callMany("ISnapshot_setDescription",
+                element("_this", snapshotReference) + element("description", description == null ? "" : description));
+    }
+
+    @Override
+    public synchronized void cloneFromSnapshot(VirtualMachine machine, String snapshotId, String name, boolean linked)
+            throws VBoxException {
+        String snapshotMachine = property(findSnapshot(machine, snapshotId), "ISnapshot_getMachine");
+        if (snapshotMachine.isBlank()) {
+            throw new VBoxException("VirtualBox did not return the machine state stored in the snapshot.");
+        }
+        cloneInto(machine, snapshotMachine, name, linked);
+    }
+
+    private String findSnapshot(VirtualMachine machine, String snapshotId) throws VBoxException {
+        String snapshotReference = callSingle("IMachine_findSnapshot",
+                element("_this", findMachine(machine)) + element("nameOrId", snapshotId));
+        if (snapshotReference.isBlank()) {
+            throw new VBoxException("The snapshot no longer exists on the VirtualBox server.");
+        }
+        return snapshotReference;
+    }
+
+    private Snapshot readSnapshot(String snapshotReference, String currentSnapshotId) throws VBoxException {
+        String id = property(snapshotReference, "ISnapshot_getId");
+        List<Snapshot> children = new ArrayList<>();
+        for (String child : callMany("ISnapshot_getChildren", element("_this", snapshotReference))) {
+            if (!child.isBlank()) {
+                children.add(readSnapshot(child, currentSnapshotId));
+            }
+        }
+        return new Snapshot(id,
+                property(snapshotReference, "ISnapshot_getName"),
+                property(snapshotReference, "ISnapshot_getDescription"),
+                timestampOf(snapshotReference),
+                "true".equalsIgnoreCase(property(snapshotReference, "ISnapshot_getOnline")),
+                id.equals(currentSnapshotId),
+                children);
+    }
+
+    /** VirtualBox reports the snapshot timestamp in milliseconds since the epoch. */
+    private long timestampOf(String snapshotReference) throws VBoxException {
+        String timestamp = property(snapshotReference, "ISnapshot_getTimeStamp").trim();
+        try {
+            return timestamp.isEmpty() ? 0L : Long.parseLong(timestamp);
+        } catch (NumberFormatException exception) {
+            LOG.debug("VirtualBox returned an unreadable snapshot timestamp '{}'.", timestamp, exception);
+            return 0L;
+        }
+    }
+
+    @Override
     public synchronized void createMachine(String name, String osType, int memoryMb, int cpuCount) throws VBoxException {
         registerNewMachine(name, osType, memoryMb, cpuCount);
     }
@@ -653,25 +730,31 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
     @Override
     public synchronized void cloneMachine(VirtualMachine machine, String name, boolean linked) throws VBoxException {
         String sourceMachine = findMachine(machine);
+        if (linked) {
+            takeSnapshot(machine, "Base for " + machine.name() + " and " + name,
+                    "Snapshot automatically created for linked clone " + name + ".");
+            String snapshot = property(sourceMachine, "IMachine_getCurrentSnapshot");
+            if (snapshot.isBlank()) {
+                throw new VBoxException("VirtualBox did not create a base snapshot for the linked clone.");
+            }
+            sourceMachine = property(snapshot, "ISnapshot_getMachine");
+        }
+        cloneInto(machine, sourceMachine, name, linked);
+    }
+
+    /** Clones {@code sourceMachine}, which is either a guest or the machine state stored in a snapshot. */
+    private void cloneInto(VirtualMachine machine, String sourceMachine, String name, boolean linked)
+            throws VBoxException {
+        String machineReference = findMachine(machine);
         String cloneMachine = callSingle("IVirtualBox_createMachine",
                 element("_this", virtualBoxReference)
                         + element("settingsFile", "")
                         + element("name", name)
-                        + element("groups", groupProperty(sourceMachine))
-                        + element("osTypeId", property(sourceMachine, "IMachine_getOSTypeId"))
+                        + element("groups", groupProperty(machineReference))
+                        + element("osTypeId", property(machineReference, "IMachine_getOSTypeId"))
                         + element("flags", ""));
 
         try {
-            if (linked) {
-                takeSnapshot(machine, "Base for " + machine.name() + " and " + name,
-                        "Snapshot automatically created for linked clone " + name + ".");
-                String snapshot = property(sourceMachine, "IMachine_getCurrentSnapshot");
-                if (snapshot.isBlank()) {
-                    throw new VBoxException("VirtualBox did not create a base snapshot for the linked clone.");
-                }
-                sourceMachine = property(snapshot, "ISnapshot_getMachine");
-            }
-
             String options = linked ? element("options", "Link") : "";
             String progress = callSingle("IMachine_cloneTo",
                     element("_this", sourceMachine)
@@ -1412,6 +1495,27 @@ public final class VirtualBoxWebServiceClient implements VirtualBoxClient {
         withSession(machine, session -> {
             String keyboard = property(session.console(), "IConsole_getKeyboard");
             callMany("IKeyboard_putCAD", element("_this", keyboard));
+            return null;
+        });
+    }
+
+    @Override
+    public synchronized void sendScancodes(VirtualMachine machine, int... scancodes) throws VBoxException {
+        withSession(machine, session -> {
+            String keyboard = property(session.console(), "IConsole_getKeyboard");
+            for (int scancode : scancodes) {
+                callMany("IKeyboard_putScancode",
+                        element("_this", keyboard) + element("scancode", Integer.toString(scancode)));
+            }
+            return null;
+        });
+    }
+
+    @Override
+    public synchronized void releaseKeys(VirtualMachine machine) throws VBoxException {
+        withSession(machine, session -> {
+            String keyboard = property(session.console(), "IConsole_getKeyboard");
+            callMany("IKeyboard_releaseKeys", element("_this", keyboard));
             return null;
         });
     }

@@ -26,6 +26,7 @@ import javax.swing.JTable;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JPasswordField;
+import javax.swing.JPopupMenu;
 import javax.swing.JProgressBar;
 import javax.swing.JRadioButton;
 import javax.swing.JScrollPane;
@@ -75,7 +76,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -100,9 +103,14 @@ public final class RemoteBoxApplication extends JFrame {
     private static final Logger LOG = LogManager.getLogger(RemoteBoxApplication.class);
     private static final String APP_NAME = "Virtual Machines";
     private static final DateTimeFormatter LOG_TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final DateTimeFormatter SNAPSHOT_TIME =
+            DateTimeFormatter.ofPattern("EEE MMM d HH:mm:ss yyyy", java.util.Locale.ROOT)
+                    .withZone(ZoneId.systemDefault());
     private static final String[] TRANSPORT_LABELS = {
             "VirtualBox Web Service", "VirtualBox VBoxManage (local or SSH)"};
     private static final int MAX_LOG_LINES = 2_000;
+    /** PS/2 press scancodes of F1 to F12; the release code is the press code plus 128. */
+    private static final int[] FUNCTION_KEY_CODES = {59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88};
 
     private final ApplicationSettings preferences = ApplicationSettings.shared();
     private final ConnectionProfiles profiles = new ConnectionProfiles(preferences);
@@ -110,8 +118,9 @@ public final class RemoteBoxApplication extends JFrame {
     private final JTree machineTree = new JTree(machineModel);
     private final JTextArea detailsArea = new JTextArea();
     private final JTextArea logArea = new JTextArea();
-    private final JTextArea snapshotsArea = new JTextArea();
-    private final JCheckBox extendedDetails = new JCheckBox("Show Extended Info");
+    private final DefaultTreeModel snapshotModel = new DefaultTreeModel(new DefaultMutableTreeNode());
+    private final JTree snapshotTree = new JTree(snapshotModel);
+    private final JLabel snapshotStatus = new JLabel("Select a guest to view its snapshots.");
     private final JLabel connectionStatus = new JLabel("Disconnected");
     private final JLabel machineCountLabel = new JLabel("No guests");
     private final JProgressBar serverMemoryBar = new JProgressBar(0, 100);
@@ -119,16 +128,24 @@ public final class RemoteBoxApplication extends JFrame {
 
     private JButton startButton;
     private JButton stopButton;
-    private JButton pauseButton;
+    private JButton discardButton;
     private JButton resetButton;
     private JButton displayButton;
+    private JButton keyboardButton;
     private JButton settingsButton;
+    private JButton takeSnapshotButton;
+    private JButton deleteSnapshotButton;
+    private JButton restoreSnapshotButton;
+    private JButton snapshotPropertiesButton;
+    private JButton cloneSnapshotButton;
     private JMenu machineMenu;
     private VirtualBoxClient client;
     private boolean busy;
     private long connectionGeneration;
     private long snapshotPreviewGeneration;
     private String snapshotPreviewMachineId;
+    private Snapshot.Tree shownSnapshots = Snapshot.Tree.EMPTY;
+    private String shownSnapshotMachineId;
     private long hostMemoryGeneration;
     private long machineRefreshGeneration;
     private boolean machineRefreshRunning;
@@ -186,10 +203,20 @@ public final class RemoteBoxApplication extends JFrame {
                 disconnect();
                 RemoteBox.forget(RemoteBoxApplication.this);
             }
-
+        });
+        // The periodic refresh only runs while the user actually looks at the window.
+        addWindowFocusListener(new WindowAdapter() {
             @Override
             public void windowGainedFocus(WindowEvent event) {
-                refreshAll();
+                if (client != null) {
+                    refreshAll();
+                    refreshTimer.start();
+                }
+            }
+
+            @Override
+            public void windowLostFocus(WindowEvent event) {
+                refreshTimer.stop();
             }
         });
 
@@ -218,7 +245,7 @@ public final class RemoteBoxApplication extends JFrame {
         logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
         logArea.setRows(6);
 
-        refreshTimer = new Timer(preferences.getInt("refresh.seconds", 30) * 1_000, event -> refreshAll());
+        refreshTimer = new Timer(preferences.getInt("refresh.seconds", 5) * 1_000, event -> refreshAll());
         appendLog("Welcome to " + APP_NAME + ".");
         appendLog("Settings: " + preferences.location());
         if (!preferences.importReport().summary().isBlank()) {
@@ -307,7 +334,9 @@ public final class RemoteBoxApplication extends JFrame {
 
         JMenu devices = new JMenu("Devices");
         devices.add(menuItem("Guest Display", event -> openDisplay()));
-        devices.add(menuItem("Send Ctrl-Alt-Del", event -> sendCtrlAltDelete()));
+        JMenu keyboard = new JMenu("Keyboard");
+        addKeyboardItems(keyboard);
+        devices.add(keyboard);
         devices.add(menuItem("Save Screenshot…", event -> saveScreenshot()));
         menuBar.add(devices);
 
@@ -331,24 +360,23 @@ public final class RemoteBoxApplication extends JFrame {
 
         startButton = remoteBoxToolButton("Start", "vm_start_32px.png",
                 event -> runMachineAction("Starting", VirtualBoxClient::start));
-        stopButton = remoteBoxToolButton("Stop", "stop_32px.png", event -> powerOffSelected());
-        pauseButton = remoteBoxToolButton("Pause", "keyboard_32px.png", event -> pauseOrResume());
-        JButton discardButton = remoteBoxToolButton("Discard", "vm_discard_32px.png",
+        stopButton = dropdownToolButton("Stop", "stop_32px.png", event -> showStopMenu());
+        stopButton.setToolTipText("Stop the guest — choose how in the menu");
+        discardButton = remoteBoxToolButton("Discard", "vm_discard_32px.png",
                 event -> runMachineAction("Discarding saved state for", VirtualBoxClient::discardSavedState));
+        discardButton.setToolTipText("Discard the guest's saved state so it boots from scratch");
         resetButton = remoteBoxToolButton("Reset", "reset_32px.png", event -> resetSelected());
         toolBar.add(startButton);
         toolBar.add(stopButton);
-        toolBar.add(pauseButton);
         toolBar.add(discardButton);
         toolBar.add(resetButton);
         toolBar.addSeparator(new Dimension(18, 38));
 
         displayButton = remoteBoxToolButton("Guest Display", "vrdp_32px.png", event -> openDisplay());
         toolBar.add(displayButton);
-        toolBar.add(remoteBoxToolButton("Ctrl-Alt-Del", "keyboard_32px.png",
-                event -> sendCtrlAltDelete()));
-        toolBar.addSeparator(new Dimension(18, 38));
-        toolBar.add(remoteBoxToolButton("Refresh", "refresh_32px.png", event -> refreshAllReportingErrors()));
+        keyboardButton = dropdownToolButton("Keyboard", "keyboard_32px.png", event -> showKeyboardMenu());
+        keyboardButton.setToolTipText("Send a keyboard sequence to the guest — choose it in the menu");
+        toolBar.add(keyboardButton);
         return toolBar;
     }
 
@@ -360,21 +388,11 @@ public final class RemoteBoxApplication extends JFrame {
 
         JPanel infoPanel = new JPanel(new BorderLayout(0, 5));
         infoPanel.setBorder(new EmptyBorder(8, 10, 8, 10));
-        extendedDetails.setSelected(preferences.getBoolean("details.extended", false));
-        extendedDetails.addActionListener(event -> {
-            preferences.putBoolean("details.extended", extendedDetails.isSelected());
-            updateSelection();
-        });
-        infoPanel.add(extendedDetails, BorderLayout.NORTH);
         infoPanel.add(darkScrollPane(detailsArea), BorderLayout.CENTER);
 
         JTabbedPane rightTabs = darkTabbedPane();
         rightTabs.addTab("Guest Info", icon("rb_settings_16px.png", 16), infoPanel);
-        snapshotsArea.setEditable(false);
-        snapshotsArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
-        snapshotsArea.setText("Select a guest to view its snapshots.");
-        snapshotsArea.setBorder(new EmptyBorder(10, 10, 10, 10));
-        rightTabs.addTab("Snapshots", icon("snapshot_manager_16px.png", 16), darkScrollPane(snapshotsArea));
+        rightTabs.addTab("Snapshots", icon("snapshot_manager_16px.png", 16), createSnapshotPanel());
 
         JSplitPane mainSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftTabs, rightTabs);
         mainSplit.setResizeWeight(0.50);
@@ -392,6 +410,58 @@ public final class RemoteBoxApplication extends JFrame {
         root.add(serverMemoryBar, BorderLayout.NORTH);
         root.add(mainSplit, BorderLayout.CENTER);
         return root;
+    }
+
+    private JPanel createSnapshotPanel() {
+        JToolBar toolBar = new JToolBar();
+        toolBar.setFloatable(false);
+        toolBar.setBorder(new EmptyBorder(4, 10, 3, 10));
+        toolBar.setBackground(MiraDarkTheme.PANEL_BACKGROUND);
+
+        takeSnapshotButton = remoteBoxToolButton("Take", "snapshot_take_32px.png", event -> takeSnapshot());
+        takeSnapshotButton.setToolTipText("Take a snapshot of the guest");
+        deleteSnapshotButton = remoteBoxToolButton("Delete", "snapshot_delete_32px.png",
+                event -> deleteSelectedSnapshot());
+        deleteSnapshotButton.setToolTipText("Delete the selected snapshot");
+        restoreSnapshotButton = remoteBoxToolButton("Restore", "snapshot_restore_32px.png",
+                event -> restoreSelectedSnapshot());
+        restoreSnapshotButton.setToolTipText("Restore the guest to the state saved in the snapshot");
+        snapshotPropertiesButton = remoteBoxToolButton("Properties", "snapshot_show_details_32px.png",
+                event -> showSnapshotProperties());
+        snapshotPropertiesButton.setToolTipText("Show and edit the snapshot properties");
+        cloneSnapshotButton = remoteBoxToolButton("Clone", "vm_clone_32px.png", event -> cloneSelectedSnapshot());
+        cloneSnapshotButton.setToolTipText("Create a new guest cloned from the snapshot");
+        toolBar.add(takeSnapshotButton);
+        toolBar.add(deleteSnapshotButton);
+        toolBar.add(restoreSnapshotButton);
+        toolBar.add(snapshotPropertiesButton);
+        toolBar.add(cloneSnapshotButton);
+
+        snapshotTree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION);
+        snapshotTree.addTreeSelectionListener(event -> updateSnapshotActionState());
+        snapshotTree.setCellRenderer(new SnapshotTreeRenderer());
+        snapshotTree.setRootVisible(false);
+        snapshotTree.setShowsRootHandles(true);
+        snapshotTree.setRowHeight(26);
+        snapshotTree.setBackground(MiraDarkTheme.BACKGROUND);
+        snapshotTree.setOpaque(true);
+        snapshotTree.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent event) {
+                if (event.getClickCount() == 2 && selectedSnapshot() != null) {
+                    showSnapshotProperties();
+                }
+            }
+        });
+
+        snapshotStatus.setBorder(new EmptyBorder(4, 12, 6, 12));
+        snapshotStatus.setForeground(MiraDarkTheme.DISABLED_FOREGROUND);
+
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.add(toolBar, BorderLayout.NORTH);
+        panel.add(darkScrollPane(snapshotTree), BorderLayout.CENTER);
+        panel.add(snapshotStatus, BorderLayout.SOUTH);
+        return panel;
     }
 
     private JPanel createStatusBar() {
@@ -524,7 +594,7 @@ public final class RemoteBoxApplication extends JFrame {
         machineTree.clearSelection();
         machineTree.expandRow(0);
         detailsArea.setText("");
-        snapshotsArea.setText("Select a guest to view its snapshots.");
+        clearSnapshots("Select a guest to view its snapshots.");
         connectionStatus.setText("Disconnected");
         machineCountLabel.setText("No guests");
         showHostMemory(null);
@@ -580,6 +650,7 @@ public final class RemoteBoxApplication extends JFrame {
     private void refreshAll() {
         refreshMachines(false);
         refreshHostMemory();
+        reloadSnapshots();
     }
 
     private void refreshAllReportingErrors() {
@@ -1091,7 +1162,7 @@ public final class RemoteBoxApplication extends JFrame {
 
     private void showPreferencesDialog() {
         RemoteBoxProfileReader.DisplaySettings display = preferences.displaySettings();
-        JTextField refreshSeconds = new JTextField(Integer.toString(preferences.getInt("refresh.seconds", 30)), 8);
+        JTextField refreshSeconds = new JTextField(Integer.toString(preferences.getInt("refresh.seconds", 5)), 8);
         JCheckBox confirmActions = new JCheckBox("Confirm destructive guest actions",
                 preferences.getBoolean("confirm.actions", true));
         String autoConnectName = profiles.autoConnectName();
@@ -3550,14 +3621,22 @@ public final class RemoteBoxApplication extends JFrame {
 
     private void updateSelection() {
         VirtualMachine machine = selectedMachine();
-        detailsArea.setText(machine == null ? "" : machineDetails(machine, extendedDetails.isSelected()));
+        detailsArea.setText(machine == null ? "" : machineDetails(machine));
         detailsArea.setCaretPosition(0);
         updateSnapshotPreview(machine);
         updateActionState();
     }
 
     private void updateSnapshotPreview(VirtualMachine machine) {
-        if (machine != null && machine.id().equals(snapshotPreviewMachineId)) {
+        updateSnapshotPreview(machine, false);
+    }
+
+    /**
+     * @param reload re-reads the snapshot tree of the already shown guest, which the
+     *               periodic refresh needs and a plain selection change does not
+     */
+    private void updateSnapshotPreview(VirtualMachine machine, boolean reload) {
+        if (!reload && machine != null && machine.id().equals(snapshotPreviewMachineId)) {
             // Snapshots only change through explicit actions, so neither the periodic
             // refresh nor the two-stage guest list must re-walk the snapshot tree.
             return;
@@ -3565,23 +3644,26 @@ public final class RemoteBoxApplication extends JFrame {
         long generation = ++snapshotPreviewGeneration;
         if (machine == null) {
             snapshotPreviewMachineId = null;
-            snapshotsArea.setText("Select a guest to view its snapshots.");
+            clearSnapshots("Select a guest to view its snapshots.");
             return;
         }
         VirtualBoxClient snapshotClient = client;
         if (snapshotClient == null) {
             snapshotPreviewMachineId = null;
-            snapshotsArea.setText("Connect to a VirtualBox host to view snapshots.");
+            clearSnapshots("Connect to a VirtualBox host to view snapshots.");
             return;
         }
 
         String machineId = machine.id();
+        boolean shown = machineId.equals(shownSnapshotMachineId);
         snapshotPreviewMachineId = machineId;
-        snapshotsArea.setText("Loading snapshots for " + machine.name() + "…");
-        new SwingWorker<List<String>, Void>() {
+        if (!shown) {
+            clearSnapshots("Loading snapshots for " + machine.name() + "…");
+        }
+        new SwingWorker<Snapshot.Tree, Void>() {
             @Override
-            protected List<String> doInBackground() throws Exception {
-                return snapshotClient.snapshots(machine);
+            protected Snapshot.Tree doInBackground() throws Exception {
+                return snapshotClient.snapshotTree(machine);
             }
 
             @Override
@@ -3594,21 +3676,240 @@ public final class RemoteBoxApplication extends JFrame {
                     return;
                 }
                 try {
-                    List<String> snapshots = get();
-                    String text = snapshots.isEmpty()
-                            ? "No snapshots exist for '" + machine.name() + "'."
-                            : "Snapshots for " + machine.name() + System.lineSeparator() + System.lineSeparator()
-                                    + String.join(System.lineSeparator(), snapshots);
-                    snapshotsArea.setText(text);
-                    snapshotsArea.setCaretPosition(0);
+                    showSnapshots(machine, get());
                 } catch (Exception exception) {
                     snapshotPreviewMachineId = null;
                     Throwable cause = exception.getCause() == null ? exception : exception.getCause();
                     LOG.warn("Loading the snapshots of {} failed.", machine.name(), cause);
-                    snapshotsArea.setText("Could not load snapshots: " + cause.getMessage());
+                    clearSnapshots("Could not load snapshots: " + cause.getMessage());
                 }
             }
         }.execute();
+    }
+
+    private void clearSnapshots(String message) {
+        shownSnapshots = Snapshot.Tree.EMPTY;
+        shownSnapshotMachineId = null;
+        snapshotModel.setRoot(new DefaultMutableTreeNode());
+        snapshotStatus.setText(message);
+        updateSnapshotActionState();
+    }
+
+    private void showSnapshots(VirtualMachine machine, Snapshot.Tree tree) {
+        snapshotStatus.setText(tree.isEmpty()
+                ? "No snapshots exist for '" + machine.name() + "'."
+                : "Snapshots of " + machine.name() + ".");
+        if (machine.id().equals(shownSnapshotMachineId) && tree.equals(shownSnapshots)) {
+            // Rebuilding drops the selection and collapses the tree, so an unchanged
+            // periodic refresh must leave it alone.
+            return;
+        }
+        shownSnapshots = tree;
+        shownSnapshotMachineId = machine.id();
+
+        Snapshot previous = selectedSnapshot();
+        DefaultMutableTreeNode root = new DefaultMutableTreeNode();
+        for (Snapshot snapshot : tree.roots()) {
+            root.add(snapshotNode(snapshot, tree.currentStateModified()));
+        }
+        snapshotModel.setRoot(root);
+        for (int row = 0; row < snapshotTree.getRowCount(); row++) {
+            snapshotTree.expandRow(row);
+        }
+        if (previous != null) {
+            restoreSnapshotSelection(previous.reference());
+        }
+        updateSnapshotActionState();
+    }
+
+    private void restoreSnapshotSelection(String reference) {
+        for (int row = 0; row < snapshotTree.getRowCount(); row++) {
+            TreePath path = snapshotTree.getPathForRow(row);
+            if (path.getLastPathComponent() instanceof DefaultMutableTreeNode node
+                    && node.getUserObject() instanceof Snapshot snapshot
+                    && snapshot.reference().equals(reference)) {
+                snapshotTree.setSelectionPath(path);
+                return;
+            }
+        }
+    }
+
+    /** RemoteBox lists the live state as a child of the snapshot the guest runs off. */
+    private static DefaultMutableTreeNode snapshotNode(Snapshot snapshot, boolean currentStateModified) {
+        DefaultMutableTreeNode node = new DefaultMutableTreeNode(snapshot);
+        if (snapshot.current()) {
+            node.add(new DefaultMutableTreeNode(new CurrentState(currentStateModified)));
+        }
+        for (Snapshot child : snapshot.children()) {
+            node.add(snapshotNode(child, currentStateModified));
+        }
+        return node;
+    }
+
+    private Snapshot selectedSnapshot() {
+        TreePath selection = snapshotTree.getSelectionPath();
+        if (selection == null || !(selection.getLastPathComponent() instanceof DefaultMutableTreeNode node)) {
+            return null;
+        }
+        return node.getUserObject() instanceof Snapshot snapshot ? snapshot : null;
+    }
+
+    /** [Current State] restores the snapshot it was derived from. */
+    private Snapshot restorableSnapshot() {
+        Snapshot snapshot = selectedSnapshot();
+        if (snapshot != null) {
+            return snapshot;
+        }
+        TreePath selection = snapshotTree.getSelectionPath();
+        if (selection == null || !(selection.getLastPathComponent() instanceof DefaultMutableTreeNode node)
+                || !(node.getUserObject() instanceof CurrentState)
+                || !(node.getParent() instanceof DefaultMutableTreeNode parent)) {
+            return null;
+        }
+        return parent.getUserObject() instanceof Snapshot parentSnapshot ? parentSnapshot : null;
+    }
+
+    private void updateSnapshotActionState() {
+        if (takeSnapshotButton == null) {
+            return;
+        }
+        boolean guestSelected = client != null && !busy && selectedMachine() != null;
+        boolean snapshotSelected = guestSelected && selectedSnapshot() != null;
+        takeSnapshotButton.setEnabled(guestSelected && !snapshotSelected);
+        deleteSnapshotButton.setEnabled(snapshotSelected);
+        restoreSnapshotButton.setEnabled(guestSelected && restorableSnapshot() != null);
+        snapshotPropertiesButton.setEnabled(snapshotSelected);
+        cloneSnapshotButton.setEnabled(snapshotSelected);
+    }
+
+    private void reloadSnapshots() {
+        invalidateSnapshotPreview();
+        updateSnapshotPreview(selectedMachine(), true);
+    }
+
+    private void restoreSelectedSnapshot() {
+        VirtualMachine machine = selectedMachine();
+        Snapshot snapshot = restorableSnapshot();
+        if (machine == null || snapshot == null || !requireConnection()) {
+            return;
+        }
+        boolean restart = machine.canStop();
+        if (!confirmDestructiveAction("Restore '" + machine.name() + "' to snapshot '" + snapshot.name()
+                + "'? Changes made since the snapshot was taken are lost."
+                + (restart ? "\nThe running guest is powered off and started again." : ""),
+                "Confirm Snapshot Restore")) {
+            return;
+        }
+        runBackground("Restoring snapshot", () -> {
+            if (restart) {
+                client.powerOff(machine);
+            }
+            restoreSnapshot(machine, snapshot.reference(), restart);
+            if (restart) {
+                client.start(machine);
+            }
+            return snapshot.name();
+        }, restored -> {
+            appendLog("Restored snapshot '" + restored + "' for " + machine.name() + ".");
+            invalidateSnapshotPreview();
+            refreshMachines();
+        });
+    }
+
+    /** VirtualBox can still hold the machine lock right after a power off, so retry briefly. */
+    private void restoreSnapshot(VirtualMachine machine, String snapshot, boolean retry) throws VBoxException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                client.restoreSnapshot(machine, snapshot);
+                return;
+            } catch (VBoxException exception) {
+                if (!retry || attempt >= 10) {
+                    throw exception;
+                }
+                LOG.debug("Restoring {} failed on attempt {}; the guest may still be shutting down.",
+                        machine.name(), attempt, exception);
+                try {
+                    Thread.sleep(1_000);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw exception;
+                }
+            }
+        }
+    }
+
+    private void deleteSelectedSnapshot() {
+        VirtualMachine machine = selectedMachine();
+        Snapshot snapshot = selectedSnapshot();
+        if (machine == null || snapshot == null || !requireConnection()) {
+            return;
+        }
+        if (!confirmDestructiveAction("Delete snapshot '" + snapshot.name() + "'?", "Confirm Snapshot Deletion")) {
+            return;
+        }
+        runBackground("Deleting snapshot", () -> {
+            client.deleteSnapshot(machine, snapshot.reference());
+            return snapshot.name();
+        }, deleted -> {
+            appendLog("Deleted snapshot '" + deleted + "' for " + machine.name() + ".");
+            invalidateSnapshotPreview();
+            refreshMachines();
+        });
+    }
+
+    private void showSnapshotProperties() {
+        VirtualMachine machine = selectedMachine();
+        Snapshot snapshot = selectedSnapshot();
+        if (machine == null || snapshot == null || !requireConnection()) {
+            return;
+        }
+        JTextField name = new JTextField(snapshot.name(), 28);
+        JTextArea description = new JTextArea(snapshot.description(), 5, 28);
+        description.setLineWrap(true);
+        description.setWrapStyleWord(true);
+        JPanel content = formPanel(new String[]{"Name", "Taken", "Description"},
+                new Component[]{name, new JLabel(snapshotTimestamp(snapshot)), new JScrollPane(description)});
+        if (JOptionPane.showConfirmDialog(this, content, "Snapshot Properties — " + snapshot.name(),
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION
+                || name.getText().isBlank()) {
+            return;
+        }
+        runBackground("Updating snapshot", () -> {
+            client.updateSnapshot(machine, snapshot.reference(), name.getText().trim(), description.getText());
+            return name.getText().trim();
+        }, updated -> {
+            appendLog("Updated snapshot '" + updated + "' of " + machine.name() + ".");
+            reloadSnapshots();
+        });
+    }
+
+    private void cloneSelectedSnapshot() {
+        VirtualMachine machine = selectedMachine();
+        Snapshot snapshot = selectedSnapshot();
+        if (machine == null || snapshot == null || !requireConnection()) {
+            return;
+        }
+        JTextField name = new JTextField(machine.name() + " Clone", 28);
+        JCheckBox linked = new JCheckBox("Create a linked clone", false);
+        JPanel content = formPanel(new String[]{"Name", ""}, new Component[]{name, linked});
+        if (JOptionPane.showConfirmDialog(this, content, "Clone from Snapshot — " + snapshot.name(),
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION
+                || name.getText().isBlank()) {
+            return;
+        }
+        runBackground("Cloning guest", () -> {
+            client.cloneFromSnapshot(machine, snapshot.reference(), name.getText().trim(), linked.isSelected());
+            return name.getText().trim();
+        }, clone -> {
+            appendLog("Created clone '" + clone + "' from snapshot '" + snapshot.name() + "'.");
+            refreshMachines();
+        });
+    }
+
+    private static String snapshotTimestamp(Snapshot snapshot) {
+        return snapshot.timestampMillis() <= 0
+                ? "Unknown"
+                : SNAPSHOT_TIME.format(Instant.ofEpochMilli(snapshot.timestampMillis()));
     }
 
     /** Forces the next preview update to re-read the snapshot tree. */
@@ -3623,14 +3924,13 @@ public final class RemoteBoxApplication extends JFrame {
         if (startButton != null) {
             startButton.setEnabled(selected && machine.canStart());
             stopButton.setEnabled(selected && machine.canStop());
-            if (pauseButton != null) {
-                pauseButton.setEnabled(selected && (machine.isRunning() || machine.isPaused()));
-                pauseButton.setText(machine != null && machine.isPaused() ? "▶ Resume" : "Ⅱ Pause");
-            }
+            discardButton.setEnabled(selected && machine.isSaved());
             resetButton.setEnabled(selected && machine.canStop());
             displayButton.setEnabled(selected && machine.isRunning());
+            keyboardButton.setEnabled(selected && machine.isRunning());
             settingsButton.setEnabled(selected);
         }
+        updateSnapshotActionState();
         // Keep the Guest menu accessible so "New guest…" remains available
         // even when no existing virtual machine is selected.
     }
@@ -3705,6 +4005,126 @@ public final class RemoteBoxApplication extends JFrame {
         button.setHorizontalTextPosition(SwingConstants.CENTER);
         button.setVerticalTextPosition(SwingConstants.BOTTOM);
         button.setIconTextGap(2);
+        styleToolButton(button, text);
+        button.addActionListener(listener);
+        return button;
+    }
+
+    /** A toolbar button that only opens a menu, marked by the arrow behind its label. */
+    private JButton dropdownToolButton(String text, String iconName, java.awt.event.ActionListener listener) {
+        return remoteBoxToolButton(text + " ▾", iconName, listener);
+    }
+
+    /**
+     * The Stop button is a pure dropdown: every way of stopping a guest behaves
+     * differently for the guest operating system, so none of them is a safe default.
+     */
+    private void showStopMenu() {
+        VirtualMachine machine = selectedMachine();
+        boolean stoppable = client != null && !busy && machine != null && machine.canStop();
+        JPopupMenu menu = new JPopupMenu();
+        menu.add(stopOption("Instant Power Off", "Cuts the virtual power immediately, like pulling the plug. "
+                        + "Data the guest has not written to disk is lost.", stoppable,
+                event -> powerOffSelected()));
+        menu.add(stopOption("ACPI Shutdown", "Presses the virtual power button. The guest operating system "
+                        + "shuts itself down cleanly, or ignores the signal if it has no ACPI support.", stoppable,
+                event -> runMachineAction("Sending ACPI shutdown signal", VirtualBoxClient::acpiShutdown)));
+        menu.add(stopOption("Save State", "Writes the complete memory and CPU state to disk and stops the guest. "
+                        + "The next start resumes exactly where the guest left off.", stoppable,
+                event -> runMachineAction("Saving state for", VirtualBoxClient::saveState)));
+        menu.show(stopButton, 0, stopButton.getHeight());
+    }
+
+    private static JMenuItem stopOption(String text, String tooltip, boolean enabled,
+                                        java.awt.event.ActionListener listener) {
+        JMenuItem item = menuItem(text, listener);
+        item.setToolTipText(tooltip);
+        item.setEnabled(enabled);
+        return item;
+    }
+
+    private void showKeyboardMenu() {
+        JPopupMenu menu = new JPopupMenu();
+        addKeyboardItems(menu);
+        menu.show(keyboardButton, 0, keyboardButton.getHeight());
+    }
+
+    /**
+     * The keyboard sequences of RemoteBox. The host intercepts these combinations,
+     * so they can only reach the guest through the keyboard interface.
+     */
+    private void addKeyboardItems(java.awt.Container menu) {
+        menu.add(keyboardItem("Ctrl-Alt-Del", "The secure attention sequence: sign-in screen on Windows, "
+                + "reboot on many other systems.", event -> sendCtrlAltDelete()));
+
+        JMenu consoles = new JMenu("Ctrl-Alt-F…");
+        consoles.setToolTipText("Switches a Linux or BSD guest between its virtual consoles.");
+        for (int number = 1; number <= FUNCTION_KEY_CODES.length; number++) {
+            int code = FUNCTION_KEY_CODES[number - 1];
+            String label = "Ctrl-Alt-F" + number;
+            consoles.add(keyboardItem(label, "Switches the guest to virtual console " + number + ".",
+                    event -> sendKeys(label, 29, 56, code, 157, 184, code + 128)));
+        }
+        menu.add(consoles);
+
+        JMenu sysrq = new JMenu("Alt-SysRq+…");
+        sysrq.setToolTipText("Magic SysRq commands, which a Linux kernel handles even when the guest hangs.");
+        for (int number = 1; number <= 8; number++) {
+            int code = FUNCTION_KEY_CODES[number - 1];
+            String label = "Alt-SysRq+F" + number;
+            sysrq.add(keyboardItem(label, "Runs the magic SysRq command bound to F" + number
+                            + " in the guest kernel.",
+                    event -> sendKeys(label, 56, 84, 184, 212, code, code + 128)));
+        }
+        sysrq.add(keyboardItem("Alt-SysRq+H", "Prints the list of available magic SysRq commands to the "
+                + "guest console.", event -> sendKeys("Alt-SysRq+H", 56, 84, 184, 212, 35, 163)));
+        menu.add(sysrq);
+
+        menu.add(keyboardItem("Ctrl-Alt-Backspace", "Kills the X server of a Linux guest, if the guest still "
+                + "enables that shortcut.", event -> sendKeys("Ctrl-Alt-Backspace", 29, 56, 14, 157, 184, 142)));
+        menu.add(keyboardItem("Ctrl-C", "Interrupts the program running in the guest's foreground.",
+                event -> sendKeys("Ctrl-C", 29, 46, 157, 174)));
+        menu.add(keyboardItem("Ctrl-D", "Signals end of input to the program running in the guest's foreground.",
+                event -> sendKeys("Ctrl-D", 29, 32, 157, 160)));
+        menu.add(keyboardItem("Release Keys", "Releases every key the guest still believes is held down, "
+                + "which repairs a stuck modifier key.", event -> releaseKeys()));
+    }
+
+    private static JMenuItem keyboardItem(String text, String tooltip, java.awt.event.ActionListener listener) {
+        JMenuItem item = menuItem(text, listener);
+        item.setToolTipText(tooltip);
+        return item;
+    }
+
+    private void sendKeys(String label, int... scancodes) {
+        runKeyboardAction(label, machine -> client.sendScancodes(machine, scancodes));
+    }
+
+    private void releaseKeys() {
+        runKeyboardAction("Release Keys", machine -> client.releaseKeys(machine));
+    }
+
+    private void runKeyboardAction(String label, MachineOperation operation) {
+        VirtualMachine machine = selectedMachine();
+        if (machine == null || !requireConnection()) {
+            return;
+        }
+        if (!machine.isRunning()) {
+            showError("The guest must be running before a keyboard sequence can be sent.");
+            return;
+        }
+        runBackground("Sending " + label + " to " + machine.name(), () -> {
+            operation.execute(machine);
+            return null;
+        }, ignored -> appendLog("Sent " + label + " to " + machine.name() + "."));
+    }
+
+    @FunctionalInterface
+    private interface MachineOperation {
+        void execute(VirtualMachine machine) throws VBoxException;
+    }
+
+    private void styleToolButton(JButton button, String tooltip) {
         button.setFocusable(false);
         button.setBorderPainted(false);
         button.setOpaque(true);
@@ -3712,7 +4132,7 @@ public final class RemoteBoxApplication extends JFrame {
         button.setBackground(MiraDarkTheme.PANEL_BACKGROUND);
         button.setMargin(new Insets(2, 9, 2, 9));
         button.setBorder(new EmptyBorder(3, 9, 3, 9));
-        button.setToolTipText(text);
+        button.setToolTipText(tooltip);
         button.addMouseListener(new MouseAdapter() {
             @Override
             public void mouseEntered(MouseEvent event) {
@@ -3746,8 +4166,6 @@ public final class RemoteBoxApplication extends JFrame {
                 }
             }
         });
-        button.addActionListener(listener);
-        return button;
     }
 
     /**
@@ -3807,9 +4225,10 @@ public final class RemoteBoxApplication extends JFrame {
 
         private Color commandColor() {
             return switch (name) {
-                case "vm_start_32px.png" -> SUCCESS;
-                case "stop_32px.png" -> ERROR;
+                case "vm_start_32px.png", "snapshot_take_32px.png", "snapshot_online_16px.png" -> SUCCESS;
+                case "stop_32px.png", "snapshot_delete_32px.png" -> ERROR;
                 case "reset_32px.png", "vm_discard_32px.png" -> WARNING;
+                case "snapshot_offline_16px.png" -> SAVED;
                 default -> COMMAND;
             };
         }
@@ -3925,6 +4344,39 @@ public final class RemoteBoxApplication extends JFrame {
                     graphics.drawOval(left + 1, top + 1, width - 2, width - 2);
                     graphics.drawLine(middleX, top + width / 4, middleX, middleY);
                     graphics.drawLine(middleX, middleY, right - width / 4, middleY);
+                }
+                case "snapshot_online_16px.png" -> {
+                    graphics.drawOval(left + 1, top + 1, width - 2, width - 2);
+                    graphics.fillOval(middleX - width / 5, middleY - width / 5, width * 2 / 5, width * 2 / 5);
+                }
+                case "snapshot_offline_16px.png" -> {
+                    graphics.drawOval(left + 1, top + 1, width - 2, width - 2);
+                    graphics.drawOval(middleX - width / 5, middleY - width / 5, width * 2 / 5, width * 2 / 5);
+                }
+                case "snapshot_take_32px.png" -> {
+                    graphics.drawOval(left + 1, top + 1, width - 2, width - 2);
+                    graphics.drawLine(middleX, top + width / 4, middleX, bottom - width / 4);
+                    graphics.drawLine(left + width / 4, middleY, right - width / 4, middleY);
+                }
+                case "snapshot_delete_32px.png" -> {
+                    graphics.drawOval(left + 1, top + 1, width - 2, width - 2);
+                    graphics.drawLine(left + width / 3, top + width / 3, right - width / 3, bottom - width / 3);
+                    graphics.drawLine(right - width / 3, top + width / 3, left + width / 3, bottom - width / 3);
+                }
+                case "snapshot_restore_32px.png" -> {
+                    graphics.drawArc(left + width / 6, top + width / 6, width * 2 / 3, width * 2 / 3, 142, -286);
+                    graphics.fillPolygon(new int[]{left + width / 5, left + width / 5, left + width / 2},
+                            new int[]{top + width / 5, top + width / 2, top + width / 5}, 3);
+                }
+                case "snapshot_show_details_32px.png" -> {
+                    graphics.drawOval(left + 1, top + 1, width - 2, width - 2);
+                    graphics.fillOval(middleX - Math.max(1, width / 14), top + width / 4,
+                            Math.max(2, width / 7), Math.max(2, width / 7));
+                    graphics.drawLine(middleX, middleY - width / 12, middleX, bottom - width / 4);
+                }
+                case "vm_clone_32px.png" -> {
+                    graphics.drawRoundRect(left, top, width * 2 / 3, width * 2 / 3, 3, 3);
+                    graphics.drawRoundRect(left + width / 3, top + width / 3, width * 2 / 3, width * 2 / 3, 3, 3);
                 }
                 default -> {
                     graphics.drawRoundRect(left + 1, top + 1, width - 2, width - 2, 4, 4);
@@ -4056,7 +4508,7 @@ public final class RemoteBoxApplication extends JFrame {
         return filler;
     }
 
-    private static String machineDetails(VirtualMachine machine, boolean includeExtended) {
+    private static String machineDetails(VirtualMachine machine) {
         // The guest list renders before the configuration fields arrive.
         String pending = "Loading…";
         String details = """
@@ -4086,17 +4538,7 @@ public final class RemoteBoxApplication extends JFrame {
                         ? (machine.description().isBlank() ? "(No description)" : machine.description())
                         : pending
         );
-        if (!includeExtended) {
-            return details;
-        }
-        return details + """
-
-                Extended information:
-                Raw state:     %s
-                Can start:     %s
-                Can stop:      %s
-                Saved state:   %s
-                """.formatted(machine.state(), machine.canStart(), machine.canStop(), machine.isSaved());
+        return details;
     }
 
     private record SettingsPageData(MachineSettings settings, List<NetworkAdapterSettings> networkAdapters,
@@ -4248,6 +4690,42 @@ public final class RemoteBoxApplication extends JFrame {
             for (int index = 0; index < node.getChildCount(); index++) {
                 collectMachines((DefaultMutableTreeNode) node.getChildAt(index), result);
             }
+        }
+    }
+
+    /** The live guest state, listed below the snapshot the guest currently runs off. */
+    private record CurrentState(boolean modified) {
+    }
+
+    private static final class SnapshotTreeRenderer extends DefaultTreeCellRenderer {
+        private SnapshotTreeRenderer() {
+            setOpaque(true);
+            setBackgroundNonSelectionColor(MiraDarkTheme.BACKGROUND);
+            setBackgroundSelectionColor(MiraDarkTheme.SELECTION_BACKGROUND);
+            setTextNonSelectionColor(MiraDarkTheme.FOREGROUND);
+            setTextSelectionColor(MiraDarkTheme.SELECTION_FOREGROUND);
+            setBorderSelectionColor(MiraDarkTheme.SELECTION_BACKGROUND);
+        }
+
+        @Override
+        public Component getTreeCellRendererComponent(JTree tree, Object value, boolean selected, boolean expanded,
+                                                      boolean leaf, int row, boolean focused) {
+            super.getTreeCellRendererComponent(tree, value, selected, expanded, leaf, row, focused);
+            Object item = value instanceof DefaultMutableTreeNode node ? node.getUserObject() : null;
+            if (item instanceof Snapshot snapshot) {
+                setIcon(icon(snapshot.online() ? "snapshot_online_16px.png" : "snapshot_offline_16px.png", 18));
+                setText("<html>" + escapeHtml(snapshot.name())
+                        + "<span style='color:#6F7174'>&nbsp;&nbsp;&nbsp;" + escapeHtml(snapshotTimestamp(snapshot))
+                        + "</span></html>");
+            } else if (item instanceof CurrentState currentState) {
+                setIcon(icon("machine_16px.png", 18));
+                setText(currentState.modified()
+                        ? "<html><b>[Current State]&nbsp;&nbsp;(changed)</b></html>"
+                        : "[Current State]");
+            }
+            setBorder(new EmptyBorder(2, 4, 2, 4));
+            setBackground(selected ? MiraDarkTheme.SELECTION_BACKGROUND : MiraDarkTheme.BACKGROUND);
+            return this;
         }
     }
 
