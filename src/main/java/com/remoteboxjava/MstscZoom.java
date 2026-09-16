@@ -1,15 +1,5 @@
 package com.remoteboxjava;
 
-import com.sun.jna.Native;
-import com.sun.jna.Pointer;
-import com.sun.jna.platform.win32.WinDef.HMENU;
-import com.sun.jna.platform.win32.WinDef.HWND;
-import com.sun.jna.platform.win32.WinDef.LPARAM;
-import com.sun.jna.platform.win32.WinDef.WPARAM;
-import com.sun.jna.platform.win32.WinUser.WNDENUMPROC;
-import com.sun.jna.win32.StdCallLibrary;
-import com.sun.jna.win32.W32APIOptions;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -30,7 +20,8 @@ final class MstscZoom {
 
     private static final int WM_SYSCOMMAND = 0x0112;
     private static final int MF_BYPOSITION = 0x0400;
-    private static final LPARAM NO_LPARAM = new LPARAM(0);
+    /** The menu command travels in the message's first parameter, the second is unused. */
+    private static final long NO_PARAMETER = 0;
 
     private static final long POLL_INTERVAL_MILLIS = 250;
     /** Long enough for the longest menu label; the percentages are far shorter. */
@@ -39,13 +30,12 @@ final class MstscZoom {
     private static volatile Consumer<String> logger = message -> {
     };
 
-    private final User32Ex user32 = User32Ex.INSTANCE;
-    private final WNDENUMPROC topLevelScan = this::examineWindow;
+    private final Win32.WindowVisitor topLevelScan = this::examineWindow;
     private final char[] text = new char[TEXT_BUFFER_LENGTH];
     private final String host;
     private final int percent;
 
-    private HWND session;
+    private long session;
 
     private MstscZoom(String host, int percent) {
         this.host = host;
@@ -89,9 +79,9 @@ final class MstscZoom {
     private int apply(int seconds) {
         long deadline = System.nanoTime() + seconds * 1_000_000_000L;
         while (System.nanoTime() < deadline) {
-            session = null;
-            user32.EnumWindows(topLevelScan, Pointer.NULL);
-            if (session != null) {
+            session = Win32.NO_HANDLE;
+            Win32.enumWindows(topLevelScan);
+            if (session != Win32.NO_HANDLE) {
                 int applied = zoom(session);
                 if (applied > 0) {
                     return applied;
@@ -109,10 +99,10 @@ final class MstscZoom {
     }
 
     /** @return whether to keep enumerating */
-    private boolean examineWindow(HWND window, Pointer data) {
-        if (!user32.IsWindowVisible(window)
-                || !equalsText(user32.GetClassName(window, text, text.length), SESSION_CLASS)
-                || !containsText(user32.GetWindowText(window, text, text.length), host)) {
+    private boolean examineWindow(long window) {
+        if (!Win32.isWindowVisible(window)
+                || !equalsText(Win32.getClassName(window, text), SESSION_CLASS)
+                || !containsText(Win32.getWindowText(window, text), host)) {
             return true;
         }
         session = window;
@@ -125,31 +115,31 @@ final class MstscZoom {
      *
      * @return the zoom that was selected, or 0 when the menu offers none
      */
-    private int zoom(HWND window) {
-        HMENU menu = user32.GetSystemMenu(window, false);
-        if (menu == null) {
+    private int zoom(long window) {
+        long menu = Win32.getSystemMenu(window, false);
+        if (menu == Win32.NO_HANDLE) {
             return 0;
         }
         int bestPercent = 0;
         int bestCommand = 0;
-        for (int index = 0; index < user32.GetMenuItemCount(menu); index++) {
-            HMENU submenu = user32.GetSubMenu(menu, index);
-            if (submenu == null) {
+        for (int index = 0; index < Win32.getMenuItemCount(menu); index++) {
+            long submenu = Win32.getSubMenu(menu, index);
+            if (submenu == Win32.NO_HANDLE) {
                 continue;
             }
-            for (int step = 0; step < user32.GetMenuItemCount(submenu); step++) {
-                int offered = percentage(user32.GetMenuString(submenu, step, text, text.length, MF_BYPOSITION));
+            for (int step = 0; step < Win32.getMenuItemCount(submenu); step++) {
+                int offered = percentage(Win32.getMenuString(submenu, step, text, MF_BYPOSITION));
                 if (offered > 0 && (bestPercent == 0
                         || Math.abs(offered - percent) < Math.abs(bestPercent - percent))) {
                     bestPercent = offered;
-                    bestCommand = user32.GetMenuItemID(submenu, step);
+                    bestCommand = Win32.getMenuItemId(submenu, step);
                 }
             }
         }
         if (bestPercent == 0 || bestCommand <= 0) {
             return 0;
         }
-        user32.PostMessage(window, WM_SYSCOMMAND, new WPARAM(bestCommand), NO_LPARAM);
+        Win32.postMessage(window, WM_SYSCOMMAND, bestCommand, NO_PARAMETER);
         return bestPercent;
     }
 
@@ -192,30 +182,5 @@ final class MstscZoom {
             }
         }
         return true;
-    }
-
-    /** Declared here rather than reused from JNA's User32 so every call is explicit. */
-    private interface User32Ex extends StdCallLibrary {
-        User32Ex INSTANCE = Native.load("user32", User32Ex.class, W32APIOptions.DEFAULT_OPTIONS);
-
-        boolean EnumWindows(WNDENUMPROC callback, Pointer data);
-
-        boolean IsWindowVisible(HWND window);
-
-        int GetClassName(HWND window, char[] buffer, int maximumCount);
-
-        int GetWindowText(HWND window, char[] buffer, int maximumCount);
-
-        HMENU GetSystemMenu(HWND window, boolean revert);
-
-        int GetMenuItemCount(HMENU menu);
-
-        HMENU GetSubMenu(HMENU menu, int position);
-
-        int GetMenuItemID(HMENU menu, int position);
-
-        int GetMenuString(HMENU menu, int item, char[] buffer, int maximumCount, int flags);
-
-        boolean PostMessage(HWND window, int message, WPARAM wParam, LPARAM lParam);
     }
 }

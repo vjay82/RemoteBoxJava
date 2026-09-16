@@ -1,6 +1,6 @@
 # RemoteBox Java
 
-A Maven-based Java 17 Swing application inspired by **RemoteBox 3.7**. It provides a desktop client for managing VirtualBox guests with the `VBoxManage` command-line interface.
+A Maven-based Java 22 Swing application inspired by **RemoteBox 3.7**. It provides a desktop client for managing VirtualBox guests with the `VBoxManage` command-line interface.
 
 This is a reimplementation of https://remotebox.knobgoblin.org.uk/
 
@@ -27,7 +27,7 @@ Original is GPLv2, so I am keeping that.
 
 ## Requirements
 
-- Java 17 or later
+- Java 22 or later (the Windows calls use the Foreign Function & Memory API)
 - Maven 3.9 or later
 - Oracle VirtualBox with `VBoxManage` available on `PATH`, or an explicit path/remote command configured in the connection dialog
 
@@ -63,7 +63,7 @@ java -jar target\remotebox-java-1.0.0-all.jar
 ## Use as a library
 
 The library JAR can be embedded into another Swing application. It needs
-FlatLaf and JNA Platform on the classpath (see the dependencies in `pom.xml`).
+FlatLaf on the classpath (see the dependencies in `pom.xml`).
 
 ```java
 com.remoteboxjava.RemoteBox.showWindow();

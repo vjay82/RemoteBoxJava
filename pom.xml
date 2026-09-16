@@ -11,7 +11,8 @@
     <description>A Java Swing VirtualBox management client inspired by RemoteBox.</description>
 
     <properties>
-        <maven.compiler.release>17</maven.compiler.release>
+        <!-- The Win32 calls use the Foreign Function & Memory API, final since Java 22. -->
+        <maven.compiler.release>22</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <log4j.version>2.26.0</log4j.version>
     </properties>
@@ -22,12 +23,6 @@
             <groupId>com.formdev</groupId>
             <artifactId>flatlaf</artifactId>
             <version>3.6.1</version>
-        </dependency>
-        <!-- Win32 calls for confirming mstsc's unsigned-file security prompt. -->
-        <dependency>
-            <groupId>net.java.dev.jna</groupId>
-            <artifactId>jna-platform</artifactId>
-            <version>5.14.0</version>
         </dependency>
         <!--
             Same version autoMATE ships, so embedding RemoteBox as a library
@@ -78,7 +73,7 @@
                 jar is attached under the "all" classifier so the plain
                 remotebox-java-<version>.jar stays available for host
                 applications that embed RemoteBox as a library and already
-                provide FlatLaf and JNA themselves.
+                provide FlatLaf themselves.
             -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

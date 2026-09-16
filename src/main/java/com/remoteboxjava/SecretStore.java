@@ -1,7 +1,5 @@
 package com.remoteboxjava;
 
-import com.sun.jna.platform.win32.Crypt32Util;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -36,7 +34,7 @@ final class SecretStore {
         }
         byte[] plain = toBytes(secret);
         try {
-            return Base64.getEncoder().encodeToString(Crypt32Util.cryptProtectData(plain));
+            return Base64.getEncoder().encodeToString(Win32.protectData(plain));
         } catch (Throwable failure) {
             LOG.warn("Could not encrypt the password, so it is not stored.", failure);
             return "";
@@ -52,7 +50,7 @@ final class SecretStore {
         }
         byte[] plain = null;
         try {
-            plain = Crypt32Util.cryptUnprotectData(Base64.getDecoder().decode(stored));
+            plain = Win32.unprotectData(Base64.getDecoder().decode(stored));
             return toChars(plain);
         } catch (Throwable failure) {
             // A settings file copied from another account or machine cannot be decrypted.

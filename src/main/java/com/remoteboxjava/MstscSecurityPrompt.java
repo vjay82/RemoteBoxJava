@@ -1,15 +1,5 @@
 package com.remoteboxjava;
 
-import com.sun.jna.Native;
-import com.sun.jna.Pointer;
-import com.sun.jna.platform.win32.WinDef.HWND;
-import com.sun.jna.platform.win32.WinDef.LPARAM;
-import com.sun.jna.platform.win32.WinDef.LRESULT;
-import com.sun.jna.platform.win32.WinDef.WPARAM;
-import com.sun.jna.platform.win32.WinUser.WNDENUMPROC;
-import com.sun.jna.win32.StdCallLibrary;
-import com.sun.jna.win32.W32APIOptions;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -38,8 +28,8 @@ final class MstscSecurityPrompt {
     private static final int BM_GETCHECK = 0x00F0;
     private static final int BM_CLICK = 0x00F5;
     private static final int BST_CHECKED = 1;
-    private static final WPARAM NO_WPARAM = new WPARAM(0);
-    private static final LPARAM NO_LPARAM = new LPARAM(0);
+    /** Neither message this class sends carries a parameter. */
+    private static final long NO_PARAMETER = 0;
 
     private static final long POLL_INTERVAL_MILLIS = 200;
     /** Long enough for a class name; the label only ever holds a host name. */
@@ -48,16 +38,15 @@ final class MstscSecurityPrompt {
     private static volatile Consumer<String> logger = message -> {
     };
 
-    private final User32Ex user32 = User32Ex.INSTANCE;
-    private final WNDENUMPROC topLevelScan = this::examineWindow;
-    private final WNDENUMPROC controlScan = this::examineControl;
+    private final Win32.WindowVisitor topLevelScan = this::examineWindow;
+    private final Win32.WindowVisitor controlScan = this::examineControl;
     private final char[] text = new char[TEXT_BUFFER_LENGTH];
     private final String host;
 
-    private HWND prompt;
-    private HWND clipboard;
-    private HWND connect;
-    private HWND remoteComputer;
+    private long prompt;
+    private long clipboard;
+    private long connect;
+    private long remoteComputer;
 
     private MstscSecurityPrompt(String host) {
         this.host = host;
@@ -99,9 +88,9 @@ final class MstscSecurityPrompt {
     private boolean confirm(int seconds) {
         long deadline = System.nanoTime() + seconds * 1_000_000_000L;
         while (System.nanoTime() < deadline) {
-            prompt = null;
-            user32.EnumWindows(topLevelScan, Pointer.NULL);
-            if (prompt != null) {
+            prompt = Win32.NO_HANDLE;
+            Win32.enumWindows(topLevelScan);
+            if (prompt != Win32.NO_HANDLE) {
                 answer();
                 return true;
             }
@@ -117,13 +106,13 @@ final class MstscSecurityPrompt {
     }
 
     /** @return whether to keep enumerating */
-    private boolean examineWindow(HWND window, Pointer data) {
-        if (!user32.IsWindowVisible(window) || !matches(user32.GetClassName(window, text, text.length), DIALOG_CLASS)) {
+    private boolean examineWindow(long window) {
+        if (!Win32.isWindowVisible(window) || !matches(Win32.getClassName(window, text), DIALOG_CLASS)) {
             return true;
         }
         findControls(window);
-        if (clipboard == null || connect == null || remoteComputer == null
-                || !matches(user32.GetWindowText(remoteComputer, text, text.length), host)) {
+        if (clipboard == Win32.NO_HANDLE || connect == Win32.NO_HANDLE || remoteComputer == Win32.NO_HANDLE
+                || !matches(Win32.getWindowText(remoteComputer, text), host)) {
             return true;
         }
         prompt = window;
@@ -135,16 +124,16 @@ final class MstscSecurityPrompt {
      * because the checkbox is nested in a container, where {@code GetDlgItem}
      * would not find it.
      */
-    private void findControls(HWND dialog) {
-        clipboard = null;
-        connect = null;
-        remoteComputer = null;
-        user32.EnumChildWindows(dialog, controlScan, Pointer.NULL);
+    private void findControls(long dialog) {
+        clipboard = Win32.NO_HANDLE;
+        connect = Win32.NO_HANDLE;
+        remoteComputer = Win32.NO_HANDLE;
+        Win32.enumChildWindows(dialog, controlScan);
     }
 
     /** @return whether to keep enumerating */
-    private boolean examineControl(HWND control, Pointer data) {
-        switch (user32.GetDlgCtrlID(control)) {
+    private boolean examineControl(long control) {
+        switch (Win32.getDialogControlId(control)) {
             case CLIPBOARD_CHECKBOX -> clipboard = control;
             case CONNECT_BUTTON -> connect = control;
             case REMOTE_COMPUTER_LABEL -> remoteComputer = control;
@@ -152,20 +141,19 @@ final class MstscSecurityPrompt {
                 return true;
             }
         }
-        return clipboard == null || connect == null || remoteComputer == null;
+        return clipboard == Win32.NO_HANDLE || connect == Win32.NO_HANDLE || remoteComputer == Win32.NO_HANDLE;
     }
 
     private void answer() {
         if (checkState(clipboard) != BST_CHECKED) {
-            user32.SendMessage(clipboard, BM_CLICK, NO_WPARAM, NO_LPARAM);
+            Win32.sendMessage(clipboard, BM_CLICK, NO_PARAMETER, NO_PARAMETER);
         }
         // Posted, because a sent click would block this thread until mstsc connects.
-        user32.PostMessage(connect, BM_CLICK, NO_WPARAM, NO_LPARAM);
+        Win32.postMessage(connect, BM_CLICK, NO_PARAMETER, NO_PARAMETER);
     }
 
-    private int checkState(HWND checkbox) {
-        LRESULT state = user32.SendMessage(checkbox, BM_GETCHECK, NO_WPARAM, NO_LPARAM);
-        return state == null ? 0 : state.intValue();
+    private int checkState(long checkbox) {
+        return (int) Win32.sendMessage(checkbox, BM_GETCHECK, NO_PARAMETER, NO_PARAMETER);
     }
 
     /** Compares the scratch buffer without materialising a string per window. */
@@ -179,26 +167,5 @@ final class MstscSecurityPrompt {
             }
         }
         return true;
-    }
-
-    /** Declared here rather than reused from JNA's User32 so every call is explicit. */
-    private interface User32Ex extends StdCallLibrary {
-        User32Ex INSTANCE = Native.load("user32", User32Ex.class, W32APIOptions.DEFAULT_OPTIONS);
-
-        boolean EnumWindows(WNDENUMPROC callback, Pointer data);
-
-        boolean EnumChildWindows(HWND parent, WNDENUMPROC callback, Pointer data);
-
-        boolean IsWindowVisible(HWND window);
-
-        int GetClassName(HWND window, char[] buffer, int maximumCount);
-
-        int GetWindowText(HWND window, char[] buffer, int maximumCount);
-
-        int GetDlgCtrlID(HWND control);
-
-        LRESULT SendMessage(HWND window, int message, WPARAM wParam, LPARAM lParam);
-
-        boolean PostMessage(HWND window, int message, WPARAM wParam, LPARAM lParam);
     }
 }
