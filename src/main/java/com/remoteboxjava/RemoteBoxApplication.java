@@ -3813,6 +3813,7 @@ public final class RemoteBoxApplication extends JFrame {
         setCursor(java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.WAIT_CURSOR));
         updateActionState();
 
+        long generation = connectionGeneration;
         new SwingWorker<T, Void>() {
             @Override
             protected T doInBackground() throws Exception {
@@ -3828,6 +3829,15 @@ public final class RemoteBoxApplication extends JFrame {
                     success.accept(get());
                 } catch (Exception exception) {
                     Throwable cause = exception.getCause() == null ? exception : exception.getCause();
+                    if (generation != connectionGeneration) {
+                        /*
+                         * Closing the window or disconnecting logs the session off, so the
+                         * still running request fails although VirtualBox carries the
+                         * operation out. Reporting that as a failure would be wrong.
+                         */
+                        LOG.debug("{} was cut short by the disconnect.", taskName, cause);
+                        return;
+                    }
                     LOG.warn("{} failed.", taskName, cause);
                     appendLog(taskName + " failed: " + cause.getMessage());
                     showError(taskName + " failed.\n\n" + cause.getMessage());
